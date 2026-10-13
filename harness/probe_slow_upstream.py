@@ -37,7 +37,8 @@ TUNED = """
 const BUDGET_MS = __BUDGET__;
 export default {
 	async fetch(request) {
-		const target = new URL(request.url).pathname.slice(1);
+		const _u = new URL(request.url);
+		const target = _u.pathname.slice(1) + _u.search;
 		const c = new AbortController();
 		const t = setTimeout(() => c.abort(), BUDGET_MS);
 		try {
@@ -55,7 +56,8 @@ export default {
 NO_ABORT = """
 export default {
 	async fetch(request) {
-		const target = new URL(request.url).pathname.slice(1);
+		const _u = new URL(request.url);
+		const target = _u.pathname.slice(1) + _u.search;
 		try {
 			const r = await fetch(target);
 			return new Response("OK " + (await r.text()).slice(0, 40), { status: r.status });

@@ -1,10 +1,28 @@
 name = "api-rv-v2"
 main = "rig/v2.js"
+
+# The compatibility date pins the runtime the proofs in harness/ were run against.
+# Changing this changes behaviour, so change it deliberately and re-run the suite.
 compatibility_date = "2026-03-24"
 
-# Pins the runtime the proofs in harness/ were run against. Changing this changes
-# behaviour, so change it deliberately and re-run the suite.
-workers_dev = false
+# workers.dev gives the deploy a reachable trigger. An earlier revision set this
+# to false and declared no routes, which made `wrangler deploy` SUCCEED while
+# publishing nothing at all: wrangler's triggersDeploy sees an empty route list
+# and its subdomainDeploy posts {"enabled": false}. The output was a worker you
+# could not call. Set this true, or replace it with a [[routes]] entry below.
+workers_dev = true
+
+# To serve a custom domain instead, set workers_dev = false and uncomment:
+# [[routes]]
+# pattern = "api.rv.pkgforge.dev"
+# custom_domain = true
+
+# Workers Logs is a THIRD billed meter (20M events included, +$0.60/M) and
+# observability is ON BY DEFAULT for new Workers. At 100M requests/month that is
+# up to +$48.00 on top of the request and CPU meters, for logs this proxy never
+# reads. Turn it off unless you want them. See RESEARCH.md 7.1.
+[observability]
+enabled = false
 
 # AUTH_TOKEN is a SECRET, not a var. Set it with:
 #   wrangler secret put AUTH_TOKEN
@@ -13,3 +31,15 @@ workers_dev = false
 # Optional. Comma-separated host suffixes. Unset means "any host".
 # [vars]
 # ALLOWED_HOSTS = "example.com,githubusercontent.com"
+
+# engine=tls is refused with a 501 unless something is bound as TLS_TRANSPORT.
+# The binding must expose fetch(url, { headers, signal }) -> Response. A service
+# binding (a Fetcher) already satisfies that shape, so an adopted userland TLS
+# transport can be wired up with, for example:
+#
+# [[services]]
+# binding = "TLS_TRANSPORT"
+# service = "my-tls-transport-worker"
+#
+# It is deliberately not bound here: shipping an unaudited TLS stack behind a
+# stealth claim would be worse than the honest default. See RESEARCH.md 3.3.

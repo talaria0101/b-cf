@@ -80,10 +80,17 @@ MUTATIONS = [
         # `looksLikeBotTool(ua)` substitution also rewrites the declaration
         # `function looksLikeBotTool(ua)`, yielding `function true {`, a syntax
         # error. The suite then fails for the wrong reason and the mutation looks
-        # "caught" while pinning nothing.
+        # "caught" while pinning nothing. Same trap for `if (transport)`: the word
+        # appears in comments and in the /__config dump.
+        #
+        # Re-anchored twice, once when the call site stopped being an `if` and
+        # again when the persona rewrite moved it into a condition chain. It is
+        # written against the current shape and re-checked on every run rather
+        # than trusted; a stale pattern here shows up as a SURVIVOR, not a silent
+        # pass, because prepare() reports PATTERN DID NOT MATCH separately.
         "genuine UA passthrough",
-        r'\tif \(looksLikeBotTool\(ua\)\) \{',
-        '\tif (false) {',
+        r'\} else if \(persona === "pass" \|\| !looksLikeBotTool\(ua\)\) \{',
+        '} else if (persona === "pass") {',
         "passing a genuine browser UA through unchanged (always overrides)",
     ),
     (
@@ -123,9 +130,13 @@ MUTATIONS = [
         "keeping repeated Set-Cookie headers separate instead of comma-joined",
     ),
     (
+        # Anchored to the LIST CONTENTS, not the Set constructor's shape. The set
+        # became multi-line when ACAC was added to it, so a pattern matching
+        # `new Set(["transfer-encoding"])` silently stopped matching and this
+        # mutation reported as a survivor rather than as a stale pattern.
         "content-encoding preservation",
-        r'const DROP_FROM_RESPONSE = new Set\(\["transfer-encoding"\]\);',
-        'const DROP_FROM_RESPONSE = new Set(["transfer-encoding", "content-encoding", "content-length"]);',
+        r'\t"transfer-encoding",\n',
+        '\t"transfer-encoding", "content-encoding", "content-length",\n',
         "preserving content-encoding, the v1 response-corruption fix",
     ),
     (
@@ -138,13 +149,151 @@ MUTATIONS = [
         "plaintext client hints",
         r'\t\tif \(target\.protocol === "https:"\) \{',
         '\t\tif (true) {',
-        "withholding Client Hints from plaintext http targets",
+        "withholding Client Hints, and Upgrade-Insecure-Requests, from plaintext http targets",
+    ),
+    # --- engine=tls and the persona model (added with the Layer 1 correction) ---
+    (
+        # The honest default. Setting EDGE_UA to the Chrome string makes the
+        # default persona claim a browser over workerd's own handshake, which is
+        # the incumbent's loudest tell (proofs/01 measures it).
+        "edge persona honesty",
+        r'const EDGE_UA = "Cloudflare-Workers";',
+        'const EDGE_UA = CHROME_UA;',
+        "the default UA describing the transport instead of claiming Chrome",
+    ),
+    (
+        # Routing, not just gating: with the branch disabled, engine=tls silently
+        # serves the runtime fetch() path, which is exactly the silent fallback the
+        # 501 exists to prevent.
+        "tls engine routing",
+        r'\t\t\t\tif \(transport\) \{',
+        '\t\t\t\tif (false) {',
+        "sending engine=tls requests through the bound transport",
+    ),
+    (
+        "engine=tls 501",
+        r'\t\tif \(engine === ENGINE_TLS && \(!transport \|\| typeof transport\.fetch !== "function"\)\) \{',
+        '\t\tif (false) {',
+        "the 501 when engine=tls is asked for with no transport bound",
+    ),
+    (
+        # The persona is gated on the ENGINE. Ungating it makes any caller able to
+        # claim Chrome over the runtime handshake, with no transport involved.
+        "chrome persona gating",
+        r'const chromePersona = persona === "chrome" && requestedEngine\(request\) === ENGINE_TLS;',
+        'const chromePersona = persona === "chrome";',
+        "requiring engine=tls before the Chrome persona may claim Chrome",
+    ),
+    (
+        "secure-context upgrade header",
+        r'\t\t\theaders\.set\("upgrade-insecure-requests", "1"\);\n',
+        '',
+        "Upgrade-Insecure-Requests on an https target, which a real Chrome sends",
+    ),
+    (
+        # x-proxy-engine and x-proxy-persona are ours. Forwarding them hands the
+        # origin a control channel back through the proxy.
+        "engine header not forwarded",
+        r'\t"x-proxy-engine",\n\t"x-proxy-persona",\n',
+        '',
+        "stripping the X-Proxy-Engine and X-Proxy-Persona headers from the caller",
     ),
     (
         "allowlist label boundary",
         r'return host === want \|\| host\.endsWith\("\." \+ want\);',
         'return host === want || host.endsWith(want);',
         "the label boundary that stops evil-example.com matching example.com",
+    ),
+    # --- round 2: ten defects the adversarial reviews found, one invariant each ---
+    # Each of these survived the suite before its assertion existed. They are here
+    # so the next person does not have to rediscover that a passing suite says
+    # nothing about an invariant nothing asserts.
+    (
+        # v1 leaked Referer and cookies; Origin was the remaining one, and the CORS
+        # headers this proxy adds made a relayed request look first-party.
+        "caller Origin not forwarded",
+        r'\t"origin",\n\t"sec-fetch-site",',
+        '\t"sec-fetch-site",',
+        "not forwarding the caller's Origin and sec-fetch-* to a third party",
+    ),
+    (
+        # Only the high-entropy hints were stripped, leaving the origin holding the
+        # caller's `sec-ch-ua-platform: "macOS"` beside this proxy's own UA.
+        "caller Client Hints not forwarded",
+        r'if \(overridesIdentity && CLIENT_HINTS\.includes\(lower\)\) continue;',
+        '',
+        "dropping every caller Client Hint when the User-Agent is replaced",
+    ),
+    (
+        "CGNAT and reserved ranges",
+        r'\t\t\t\(a === 100 && b >= 64 && b <= 127\) \|\|\n',
+        '',
+        "blocking RFC 6598 100.64/10, which is not publicly routable either",
+    ),
+    (
+        "NUL byte in target",
+        r'if \(/\[\\u0000-\\u001f\\u007f\]/\.test\(candidate\)\) \{',
+        'if (false) {',
+        "refusing a target containing a NUL, which defeats the scheme check",
+    ),
+    (
+        # The only shape that reaches rewriteLocation at all, since the redirect
+        # loop consumes every 3xx-with-Location.
+        "Location rewrite on non-3xx",
+        r'\t\treturn proxyOrigin \+ "/" \+ u\.href;',
+        '\t\treturn location;',
+        "rewriting a Location on a non-3xx into proxy space",
+    ),
+    (
+        # X-Proxy-Timeout-Ms was a no-op on engine=tls: the AbortController had
+        # nothing to abort, while /__config reported the timeout as resolved.
+        "abort signal reaches the transport",
+        r'\t\t\t\t\t\tsignal: init\.signal,\n',
+        '',
+        "passing the abort signal to a bound TLS_TRANSPORT",
+    ),
+    (
+        # README and section 9 both document a comma-separated ALLOWED_HOSTS.
+        "allowlist comma split",
+        r'const parts = raw\.split\(","\)\.map\(\(s\) => s\.trim\(\)\)\.filter\(Boolean\);',
+        'const parts = [raw];',
+        "splitting and trimming the documented ALLOWED_HOSTS list",
+    ),
+    (
+        # A preflight passes only if the header the browser is about to send is
+        # listed, so an omission disables the feature for every browser caller.
+        "CORS allow-headers completeness",
+        r'"X-Proxy-Engine, X-Proxy-Persona, X-Proxy-Timeout-Ms",',
+        '"",',
+        "allowing the control headers, so browsers can actually use the features",
+    ),
+    (
+        # Reflecting ACAO while passing the origin's ACAC through is the exact
+        # combination the CORS comment claims this proxy refuses to produce.
+        "upstream ACAC not forwarded",
+        r'\t"access-control-allow-credentials",\n',
+        '',
+        "stripping an upstream Access-Control-Allow-Credentials",
+    ),
+    (
+        # "/__config requires auth" is a claim about the request WITHOUT a
+        # credential; the old assertion checked the authenticated one.
+        "/__config requires auth",
+        r'\t\tconst authToken = authTokenFor\(env\);',
+        '\t\tconst authToken = authTokenFor(env);\n'
+        '\t\tif (new URL(request.url).pathname === "/__config") {\n'
+        '\t\t\treturn new Response("{}", { headers: { "content-type": "application/json" } });\n'
+        '\t\t}',
+        "refusing /__config when no credential is presented",
+    ),
+    (
+        # Two Set-Cookie LINES must survive as two lines. The old assertion read a
+        # joined header value and accepted the comma-joined corruption, so a mutant
+        # that folded the cookies together passed the whole suite.
+        "Set-Cookie kept as separate lines",
+        r'\t\t\tfor \(const c of cookies\) out\.append\("set-cookie", c\);',
+        '\t\t\tout.set("set-cookie", cookies.join(", "));',
+        "keeping repeated Set-Cookie headers as separate header lines",
     ),
 ]
 

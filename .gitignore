@@ -2,6 +2,10 @@
 bin/
 harness/node_modules/
 
+# npm cache written by the miniflare install. 55 MB of package tarballs, not
+# source, and it was untracked but NOT ignored, so `git add -A` would have staged it.
+.home/
+
 # Python bytecode
 __pycache__/
 *.pyc

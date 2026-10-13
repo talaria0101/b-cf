@@ -1,0 +1,13 @@
+sec-ch-ua
+sec-ch-ua-mobile
+sec-ch-ua-platform
+upgrade-insecure-requests
+user-agent
+accept
+sec-fetch-site
+sec-fetch-mode
+sec-fetch-user
+sec-fetch-dest
+accept-encoding
+accept-language
+priority

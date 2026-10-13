@@ -32,7 +32,8 @@ TUNED = """
 const BUDGET_MS = __BUDGET__;
 export default {
 	async fetch(request) {
-		const target = new URL(request.url).pathname.slice(1);
+		const _u = new URL(request.url);
+		const target = _u.pathname.slice(1) + _u.search;
 		const c = new AbortController();
 		const t = setTimeout(() => c.abort(), BUDGET_MS);
 		const t0 = Date.now();

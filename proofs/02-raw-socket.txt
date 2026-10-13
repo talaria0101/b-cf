@@ -1,0 +1,32 @@
+=== probe_raw_socket: does connect() give us a raw byte stream? ===
+peer: 169.254.169.1:36179 (the sandbox's HTTP CONNECT proxy, plain HTTP)
+
+--- CONTROL: workerd default network service, allow = ["public"] ---
+connect_type=function
+socket_created=true
+duplex=true
+socket_err=jsg.Error: proxy request failed, cannot connect to the specified address
+raw_stream_confirmed=false
+fetch_accepts_arbitrary_tls_keys=false
+
+  blocked as expected: True
+  That refusal is about the sandbox's address ranges, not about TLS.
+
+--- PERMISSIVE: globalOutbound = network(allow = [public, private, local]) ---
+connect_type=function
+socket_created=true
+duplex=true
+plaintext_write_ok=true
+reply_hex=485454502f312e312032303020436f6e6e656374696f6e2045737461626c69736865640d0a0d0a
+reply_text="HTTP/1.1 200 Connection Established\r\n\r\n"
+raw_stream_confirmed=true
+fetch_accepts_arbitrary_tls_keys=false
+
+  PASS  connect() is available
+  PASS  the socket is duplex
+  PASS  a plaintext write is accepted
+  PASS  the peer answered our bytes in the clear
+  PASS  fetch() exposes no TLS surface
+  PASS  CONTROL: the default config blocks that peer
+
+RESULT: connect({secureTransport:'off'}) is a raw duplex byte stream, so a Worker builds its own ClientHello and its own TLS record layer

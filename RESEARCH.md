@@ -12,26 +12,34 @@ rather than smoothed over.
 
 ## TL;DR
 
-1. **The premise needs one correction, stated plainly.** A Cloudflare Worker
-   cannot "pass as 100% real browser for captchas". The captcha token is minted by
-   JavaScript inside a real browser, and Cloudflare's own docs say automation
-   frameworks are detected as bots. No header work changes that. Section
+1. **The premise needs one correction, and it is the one Ajam asked for.** A
+   Cloudflare Worker cannot "pass as 100% real browser for captchas". The captcha
+   token is minted by JavaScript inside a real browser, and Cloudflare's own docs
+   say automation frameworks are detected as bots. Section
    [3](#3-the-captcha-question-the-unwelcome-answer).
-2. **v1's two headline features are dead code**, confirmed against the live
+2. **A second correction, mine, in the opposite direction.** An earlier draft said
+   TLS fingerprint control was impossible on Workers. It is not: `connect()` with
+   `secureTransport: "off"` hands the Worker a raw byte stream, so it writes its
+   own ClientHello. Measured under `workerd`, with the default-config failure kept
+   as a control. Section [3.3](#33-layer-1-tls-fetch-is-closed-connect-is-not).
+   This does not move the layer that actually decides most sites, which is the
+   egress IP.
+3. **v1's two headline features are dead code**, confirmed against the live
    deployed worker, not just by reading it. `cf-connecting-ip` randomisation never
    runs, and 4 of the 8 `cf-*` headers it tries to strip are re-injected by
    Cloudflare anyway. Section [2](#2-what-v1-actually-does-measured-not-read).
-3. **Serverless "real browser" does exist**, and it is not a Worker `fetch()`: it
+4. **Serverless "real browser" does exist**, and it is not a Worker `fetch()`: it
    is **Browser Run** (formerly Browser Rendering), a binding at
    **$0.09/browser-hour** after 10 free hours/month. That is the only route to
    running JS, and it is still not a captcha solver. Section [5](#5-browser-run).
-4. **Self-built cost**: **$0** up to ~3M requests/month on the Free plan
+5. **Self-built cost**: **$0** up to ~3M requests/month on the Free plan
    (100,000/day), **$5.00/month** on Paid, and **$45.40** at 100M requests/month.
    Adding Browser Run is **+$0.09 per browser-hour**, which is the number that
    decides everything. Section [7](#7-pricing).
-5. **The proofs are executable**: 115 assertions against v2 under Cloudflare's own
-   `workerd`, a negative control on the unmodified v1, and a mutation check that
-   breaks 23 invariants and requires the suite to catch every one. All green.
+6. **The proofs are executable**: 172 assertion rows against v2 under Cloudflare's
+   own `workerd`, 5 control assertions that fire on known defects, and a mutation
+   check that breaks 40 invariants and requires the suite to catch every one. All
+   green.
 
 ---
 
@@ -39,9 +47,14 @@ rather than smoothed over.
 
 The upstream file is 101 lines, 3423 bytes,
 `sha256 3e06a02a0c466b704a1d550167c346102ba2734587e85a68efd1d3d15ef0f6fa` (verified
-by download on 2026-10-13). `rig/v1-baseline.js` in this repo adds a 2-line
-provenance header and is otherwise identical; it is 103 lines, so **its** hash
-differs from the value above. Where a line number is given for v1 below, it
+by download on 2026-10-13). `rig/v1-baseline.js` in this repo is a **3-line
+provenance header plus upstream's code reformatted**: indentation widened from 2
+spaces to 4, trailing whitespace stripped, final newline dropped. It is 103 lines
+and 3799 bytes, so **its** hash differs from the value above, and it is **not**
+byte-for-byte. An earlier revision of this document and of the file's own header
+claimed it was; both were wrong and are corrected here. Whitespace is not semantic
+in JavaScript, so the negative control still exercises exactly the code upstream
+runs, which is all a control needs. Where a line number is given for v1 below, it
 refers to the upstream file.
 
 The repo is **archived** (`archived: true`, last push 2025-06-19, 2 stars, 36
@@ -156,13 +169,13 @@ acquired from Google's client-side JS in a browser.
 These are the signals that actually decide the outcome, and none of them are
 header values:
 
-| Signal | Why header work cannot fix it |
+| Signal | Can a Worker fix it? |
 |---|---|
-| **JA3 / JA4** (TLS ClientHello fingerprint) | Derived from the TLS stack. Cloudflare exposes `request.cf.botManagement.ja3Hash` and `.ja4` **to the site being protected**. `workerd` offers no per-request TLS API. |
-| **JavaScript detections** | The site injects a script and reads what the browser computes. Exposed as `request.cf.botManagement.jsDetection.passed`. No JS engine in a Worker to run it. |
-| **HTTP/2 SETTINGS and frame ordering** | Fixed by the runtime's TLS/H2 implementation. |
-| **IP reputation** | Datacenter, Cloudflare-owned egress. |
-| **Empty/absent `User-Agent`** | Per Cloudflare's [bot score](https://developers.cloudflare.com/bots/concepts/bot-score/) docs: "Requests with a missing or empty `User-Agent` header are immediately assigned a bot score of **1** by the Heuristics engine." |
+| **JA3 / JA4** (TLS ClientHello fingerprint) | **Yes, over `connect()` and no other way.** `fetch()` has no TLS surface. `connect({secureTransport:"off"})` returns a raw byte stream, so the Worker writes its own ClientHello. Section [3.3](#33-layer-1-tls-fetch-is-closed-connect-is-not), measured in `proofs/02-raw-socket.txt`. |
+| **HTTP/2 SETTINGS and frame ordering** | Same route. HTTP/2 is a framing format over a byte stream; it needs no runtime support. Costs more CPU than HTTP/1.1, not less. |
+| **JavaScript detections** | The site injects a script and reads what the browser computes. Exposed as `request.cf.botManagement.jsDetection.passed`. Needs a JS engine: Browser Run, or none. |
+| **IP reputation and ASN** | **No.** Cloudflare-owned egress, published in `172.64.0.0/13` and its neighbours. Measured: `172.69.76.176`. |
+| **Empty/absent `User-Agent`** | Yes, trivially, and the fix is honest: send a UA that describes the transport rather than pretending to be Chrome. |
 
 Two more runtime facts that make a Worker trivially identifiable to a hostile
 check, from the [Web standards](https://developers.cloudflare.com/workers/runtime-apis/web-standards/)
@@ -175,14 +188,144 @@ documentation:
 A timing-attack-resistant environment is the opposite of what a bot-detection
 heuristic wants, because it makes timing behaviour look synthetic.
 
-**What this means practically.** The honest framing is two different goals:
+**What this means practically.** The honest framing is three different goals:
 
 - **Passing naive UA/language/referrer heuristics** on ordinary sites: achievable,
   and v2 does it. Section [6](#6-v2).
+- **Presenting a chosen TLS fingerprint**: achievable, and it costs CPU rather than
+  being forbidden. Section [3.3](#33-layer-1-tls-fetch-is-closed-connect-is-not).
+  Nobody should read that as "solved", because it does not move the layer below it.
 - **Passing Turnstile / reCAPTCHA / Cloudflare JS challenges**: not achievable
   serverless, at any price, because the challenge requires a real browser plus a
   residential IP and a solved token. Anyone selling you "serverless captcha
   solving" is selling a proxy to someone else's browser farm.
+
+The distinction that matters is between what the **runtime forbids** and what it
+**charges for**. Section 3.3 is a case where an earlier draft of this document
+filed the second under the first, and section [8.9](#89-the-correction-that-changed-the-architecture)
+records it.
+
+### 3.3 Layer 1: TLS. `fetch()` is closed, `connect()` is not
+
+**Correction, stated plainly.** An earlier draft of this document claimed TLS
+fingerprint control was impossible on Workers, on the grounds that `workerd`
+"offers no per-request TLS API". The premise is wrong. `cloudflare:sockets`
+`connect()` accepts `secureTransport: "off"`, and that returns a **raw duplex byte
+stream**. The runtime is not a TLS endpoint on that path, it is a pipe, so the
+ClientHello is a byte string the Worker chooses to send.
+
+This correction came from a parallel research effort
+(`nemo-010/b-cf`, MIT; this repo is 0BSD, so nothing was copied, only checked and
+credited). I did not take it on trust. `harness/probe_raw_socket.py` measures it,
+and the measurement is in `proofs/02-raw-socket.txt`:
+
+```
+connect_type=function
+socket_created=true
+duplex=true
+plaintext_write_ok=true
+reply_hex=485454502f312e312032303020436f6e6e656374696f6e2045737461626c69736865640d0a0d0a
+reply_text="HTTP/1.1 200 Connection Established\r\n\r\n"
+raw_stream_confirmed=true
+fetch_accepts_arbitrary_tls_keys=false
+```
+
+`reply_hex` decodes to `HTTP/1.1 200 Connection Established\r\n\r\n`, which is the
+sandbox's HTTP CONNECT proxy answering the exact plaintext bytes the Worker wrote.
+A runtime still terminating TLS could not produce that: it would have to reject
+the write as nonsense or answer with a record it encrypted itself.
+
+| transport | who writes the ClientHello | the fingerprint is |
+|---|---|---|
+| `fetch()` | workerd | fixed, not a browser, and not ours |
+| `node:net` / `node:tls` | workerd, on top of `connect()` | not ours |
+| `connect()` then `startTls()` | workerd, and it fails closed for tunnels | not ours |
+| `connect({secureTransport:"off"})` + userland TLS | **us** | whatever we encode |
+
+`startTls()` is the trap worth naming, because it looks like the shortcut. It
+verifies the peer certificate against the hostname given to `connect()`, which
+inside a tunnel is the *proxy*, not the origin.
+
+**The control, which is what makes the result real.** The probe runs the identical
+worker twice. Under workerd's default network service (`allow = ["public"]` in the
+`Network` struct of `workerd.capnp`) the connect is refused:
+
+```
+socket_err=jsg.Error: proxy request failed, cannot connect to the specified address
+... workerd log: failed: connect() blocked by restrictPeers()
+```
+
+So an earlier version of this probe, which reported a successful plaintext write
+against port 9, was reporting a **race**, not a result. The socket is created
+optimistically and the connection is attempted in the background, so whether the
+write lands before the refusal arrives is timing; re-running failed outright. The
+fix was to connect to a peer that actually answers, and to keep the default-config
+failure as an explicit control. Without the control the positive result would only
+have shown that a socket object exists.
+
+**What the incumbent actually presents**, measured by fetching
+`https://tls.peet.ws/api/all` through the live worker (`proofs/01-api-rv-tls.txt`):
+
+```
+ip              = 172.69.76.178:13802
+http_version    = h2
+ja3             = 67560f98d68783bd640246df3052c151
+ja4             = t13d1312h2_a44d0ee8b3cc_e381dae6da6b
+peetprint       = 86a3486140e2241fdfbdbe981958219e
+ua              = Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ... Version/18.5 Safari/605.1.15
+```
+
+A real Chrome 155, computed by `tools/ja4.py` from the raw ClientHello in the
+b-ids corpus:
+
+```
+ja4_a     = t13i1516h2        <- TLS 1.3, 15 ciphers, 16 extensions, no SNI captured
+ja4_b     = 8daaf6152771      <- cipher-list hash, identical to Chrome's
+```
+
+**How to read `ja4_a`**, because getting this wrong is easy and I did: the fields
+are `t` + version + sni + cipher-count + extension-count + first ALPN character.
+So `t13d1312h2` is `t`, **13 = TLS 1.3**, `d` = SNI present, **13** = 13
+ciphers, **12** = 12 extensions, `h2` = ALPN. `tls_version_negotiated` in the same
+capture is `772` = `0x0304` = TLS 1.3, confirming it independently. An earlier
+draft of this document read the trailing `12` as a version and described the
+incumbent as presenting TLS 1.2; that was wrong, and it was wrong in the
+incumbent's disfavour.
+
+The real gap, which is narrower and still real: **13 ciphers against Chrome's 15,
+12 extensions against 16**, Cloudflare's own HTTP/2 SETTINGS, and a Safari 18.5
+User-Agent on top. So v2 fixes the default by describing the transport rather than
+imitating Chrome: the `edge` persona sends `User-Agent: Cloudflare-Workers` and no
+Client Hints, which is what the transport actually is. Section
+[6.4](#64-the-persona-model-and-why-the-default-is-not-chrome).
+
+On `ja4_c`: `tools/ja4.py` reproduces peet.ws's own `ja4_c` for the api.rv
+handshake (`e381dae6da6b`) exactly, so all three fields are verified against a
+third-party computation of the same bytes. An earlier revision of the tool
+labelled `ja4_c` `UNVERIFIED` because it did not reproduce the `6ff14566cf4a` that
+`nemo-010/b-cf` quotes for the b-ids capture. That label was wrong, and the cause
+is now known: reproducing their value requires keeping ALPN (`0010`) in the
+extension hash and not filtering GREASE from the signature algorithms, while
+`foxIO-LLC/ja4` `common.py` `get_hex_sorted()` removes both `0000` and `0010` and
+`get_signature_algorithms()` filters GREASE. The peer's value comes from a
+different rule, not a different capture. See section
+[8.9](#89-the-correction-that-changed-the-architecture).
+
+**The cost, since that is the real answer to "is it impossible".** A Worker has no
+cross-invocation connection pool, so this is one handshake per request. Two
+consequences for a design: TLS plus HTTP/2 in userland costs meaningfully more CPU
+than `fetch()` plus workerd's own stack, and the fast path and the shaped path
+therefore have different price tags. That is why v2's default is `engine=fetch`
+and `engine=tls` is an explicit opt-in that refuses with 501 when no transport is
+bound, rather than a silent upgrade.
+
+Prior art for the transport, which is the part that would actually be adopted
+rather than written: `latentharbor/tunnelfetch` ships TLS 1.2/1.3 and HTTP/2 in
+userland ESM with no `node:` imports, and `EithonX/socksflare` ships rustls
+compiled to WASM. v2 does not vendor either. `rig/v2.js` defines the binding
+contract (`TLS_TRANSPORT.fetch(url, {headers})`) and tests it against a stub, which
+is what a seam is for; a hand-written TLS stack behind a stealth claim would be a
+worse thing to ship than an honest default.
 
 ---
 
@@ -222,12 +365,20 @@ fingerprint because it owns a native client. A Worker cannot, and no amount of
 header code will get it there. Its browser engine is Puppeteer + real Chrome,
 launched with `--disable-blink-features=AutomationControlled`.
 
-Self-hosting it needs GCP Cloud Run, MongoDB Atlas and GCS, per its README, across
-two clusters. It is not a serverless artefact.
+Self-hosting it is not a serverless artefact. Its own README is precise about
+what the open-source branch does and does not include: the MongoDB-backed storage
+layer **"is not included here"**, and the oss branch "runs in stateless mode out of
+the box, with optional MinIO/S3-compatible bucket caching". The GCP Cloud Run +
+MongoDB Atlas + GCS stack appears in `architecture.md`, where that same file marks
+the SaaS configuration as "not part of the open source branch". So the cost of
+self-hosting is a service or two you operate, and the honest comparison is v2's
+$5/month against a container bill plus whatever datastore you attach. An earlier
+draft of this document attributed that stack to the README and inverted it.
 
 ### 4.2 browser-use
 
-117,831 stars, MIT, Python, latest release **0.13.11** (2026-10-07).
+117,859 stars (live API read on 2026-10-13; an earlier draft said 117,831),
+MIT, Python, latest release **0.13.11** (2026-10-07).
 
 The notable finding, confirmed by bisecting `pyproject.toml` across release tags:
 **as of 0.13.11 it does not depend on Playwright or patchright at all.** The
@@ -299,10 +450,15 @@ Browser Run.
 
 ## 5. Browser Run
 
-The product was renamed: `developers.cloudflare.com/browser-rendering/` **302** to
+The product was renamed: `developers.cloudflare.com/browser-rendering/` redirects to
 `/browser-run/`. The REST namespace is still `browser-rendering` in the OpenAPI
 spec, while the docs prose and samples use `browser-run`; both resolve, and I
-confirmed both return the same auth error rather than a 404.
+confirmed both return the same auth error rather than a 404. (The redirect status
+was reported as 301 by one review pass and as 302 by an earlier draft of this
+document. I could not settle it from this environment: the only reachable HTTP
+client here returns 404 for a control URL known to exist, so it cannot answer the
+question, and the claim is not load-bearing for anything below. The destination is
+what matters and it is unambiguous.)
 
 **Pricing** ([source](https://developers.cloudflare.com/browser-run/pricing/), last
 updated 21 Apr 2026, verified verbatim):
@@ -364,9 +520,15 @@ Every row is an assertion in `harness/test_proxy.py`, run under real `workerd`.
 | SSRF guard | 15 blocked forms, incl. `[::1]`, `[::ffff:a9fe:a9fe]`, `localhost.`, `2852039166`, `10.0.0.1`, `192.168.1.1` |
 | Proxy credential never forwarded | `authorization`, `proxy-authorization`, `x-proxy-key` all stripped before the origin |
 | Edge headers not forwarded | `X-Forwarded-For`, `X-Real-IP`, `CF-Ray`, `CDN-Loop` |
-| Bot-tool UA replaced, coherently | 7 tool UAs; UA version matches `sec-ch-ua`; OS matches `sec-ch-ua-platform` |
-| Only low-entropy hints sent | `sec-ch-ua-arch`/`-bitness` withheld, as Chrome does without `Accept-CH` |
-| No hints over plaintext | `sends no sec-ch-ua to a plaintext http target` |
+| Default persona is honest | `v2: does NOT claim Chrome by default`; `v2: sends no sec-ch-ua on the honest persona` |
+| Bot-tool UA replaced on the default persona | 7 tool UAs, incl. `curl`, `python-requests`, `Go-http-client`, `okhttp`, `scrapy` |
+| `persona=pass` verbatim | the caller's UA is forwarded untouched |
+| Chrome persona needs a TLS transport | `persona=chrome is refused without a TLS transport, not silently downgraded` |
+| `engine=tls` without a transport is 501 | `engine=tls without a bound transport returns 501, not a silent fallback`, and the body names `TLS_TRANSPORT` |
+| Transport branch actually routes | `tls: engine=tls routes the request to the bound transport`, plus a control that a bound transport is **not** used on `engine=fetch` |
+| Chrome persona is internally coherent | `sec-ch-ua` major == UA major; `sec-ch-ua-platform` == the UA's OS |
+| Secure-context gate | no hints and no `Upgrade-Insecure-Requests` over plaintext `http://` |
+| Control headers never forwarded | `x-proxy-engine`, `x-proxy-persona` |
 | Caller hints dropped | a supplied `sec-ch-ua-model` cannot contradict the rewritten UA |
 | Genuine browser UA untouched | verbatim, **no** hints added |
 | Cookies not leaked by default | opt-in via `X-Proxy-Forward-Cookies: 1` |
@@ -379,6 +541,11 @@ Every row is an assertion in `harness/test_proxy.py`, run under real `workerd`.
 | Per-request timeout | `X-Proxy-Timeout-Ms`, clamped to [250, 60000], resolved value observable at `/__config` |
 | Auth + allowlist | 16 assertions: 401/403 paths, case-insensitive scheme, subdomain vs lookalike |
 
+Totals across the suite: **120** in section C plus **1** CONTROL row, **10** auth and **7**
+allowlist (D), **16** engine/persona plus **1** CONTROL row (E), **8** hostlist
+(F), **6** v1 observations, plus the **3 NEG-CONTROL** rows. That is 172 rows,
+of which **5** are controls.
+
 ### 6.2 Behaviour changes that will break an existing v1 caller
 
 Stated plainly, because a proxy upgrade that silently changes results is worse
@@ -388,7 +555,13 @@ than one that fails loudly.
 |---|---|
 | Cookies no longer forwarded | Sessions that relied on the proxy passing `Cookie` **stop working**. Opt back in per request with `X-Proxy-Forward-Cookies: 1`. |
 | `Authorization` no longer forwarded | Callers using the proxy to reach an authenticated API must pass their token some other way. This is the point of the change: it is how the proxy's own credential stopped leaking. |
-| `?url=` no longer read from a non-empty path | `/api.example.com/x?url=y` previously proxied to `/api.example.com/x`; it now does the same thing (path wins). |
+| Caller `Origin` and `sec-fetch-*` no longer forwarded | A third party can no longer see which app relayed the request. Rarely depended on, and it was a leak. |
+| Caller Client Hints stripped **when** the UA is replaced | A browser caller whose UA is forwarded untouched keeps its hints. Only a bot-tool UA loses them, which is the case where they contradicted the UA. |
+| Upstream `Access-Control-Allow-Credentials` no longer passed through | An origin that opted the caller into credentialed CORS no longer can. Deliberate: pairing that with a reflected ACAO is the credentialed-open-proxy bug. |
+| `OPTIONS` is answered by the proxy, never forwarded | v1 proxied a real `OPTIONS` to the target. A caller using the proxy as a generic HTTP client for `OPTIONS` (WebDAV discovery, capability probing) now gets the proxy's 204 instead. **This is the most likely silent break.** |
+| The target path is percent-decoded | `/https://host/a%2Fb` fetched `a%2Fb` under v1 and fetches `a/b` now; `%3F` becomes a real query separator and `%23` truncates the path. A caller relying on an encoded path to stay literal is affected. |
+| Redirects capped at 5 hops | v1 followed 100, 200 and 400-hop chains and returned the final page. v2 returns **508**. Any real-world chain longer than 5 now fails. |
+| `?url=` is read only on an empty path | `/api.example.com/x?url=y` proxied to `/api.example.com/x` under v1; under v2 the path wins **and the query is preserved**, so the upstream sees `/x?url=y`. |
 | Network errors are JSON `502` | v1 returned plain-text `500`. Clients matching on 500 will not match. |
 | `Accept` always sent | v1 sent none when the caller sent none, so a raw API client now receives the browser default unless it sets `Accept` explicitly. |
 | Timeout is per hop | Worst case `(MAX_REDIRECTS+1) x MAX_TIMEOUT_MS`. |
@@ -406,6 +579,56 @@ These are the honest limits, and they are in the file as comments:
   from the outbound `Request` does not stop the edge adding them.
 - **It does not claim header consistency equals a real browser.** It fixes
   internal inconsistency, which is a subset of what a vendor checks.
+- **It does not ship a TLS stack.** `engine=tls` is a bound-injection seam, and it
+  returns 501 when nothing is bound. An earlier draft called TLS control
+  impossible; section [3.3](#33-layer-1-tls-fetch-is-closed-connect-is-not)
+  corrects that, and the seam is what the correction makes possible without
+  shipping a hand-rolled handshake behind a stealth claim.
+
+### 6.4 The persona model, and why the default is not Chrome
+
+v1 answers every request with one hardcoded Safari 18.5 User-Agent. v2 replaced
+that with three named personas, and the interesting decision is the default.
+
+| `X-Proxy-Persona` | what the origin sees | when it applies |
+|---|---|---|
+| `edge` (**default**) | `User-Agent: Cloudflare-Workers`, no `sec-ch-ua` | always |
+| `chrome` | Chrome UA + low-entropy hints + `Upgrade-Insecure-Requests` | **only** with `X-Proxy-Engine: tls` and a bound transport |
+| `pass` | the caller's UA verbatim | opt-in |
+
+The reason `edge` is the default is section 3.3's measurement. The incumbent's own
+handshake is `t13d1312h2_a44d0ee8b3cc_e381dae6da6b`, which reads as **TLS 1.3**
+with 13 ciphers and 12 extensions, while it announces Safari 18.5. A real Chrome
+155 is `t13i1516h2_8daaf6152771_...`: TLS 1.3 with **15** ciphers and **16**
+extensions. Presenting a browser User-Agent over a handshake that is not that
+browser's is a louder signal than presenting an accurate one, because the
+mismatch is the tell.
+
+So the layers have to move together, and v2 enforces that:
+
+- `edge` describes the transport honestly, and sends **no** Client Hints of its
+  own, because inventing `sec-ch-ua` would be the same overclaim in miniature.
+- `edge` also strips the **caller's** Client Hints when, and only when, it is
+  replacing their User-Agent. Leaving `sec-ch-ua-platform: "macOS"` beside a
+  `Cloudflare-Workers` UA is precisely the incoherent identity this section exists
+  to prevent, and an earlier revision stripped only the high-entropy hints and so
+  shipped exactly that. When the caller's own UA goes upstream untouched (a
+  genuine browser, or `persona=pass`) their hints go with it, because then the pair
+  is coherent.
+- `chrome` is refused unless `engine=tls` is also requested **and** a transport is
+  bound. Without one it is not silently downgraded; `engine=tls` alone returns 501.
+- Over `http://`, `chrome` still claims Chrome but sends **no** hints and **no**
+  `Upgrade-Insecure-Requests`, because Client Hints are a secure-context feature.
+
+That last one was a defect I introduced and fixed: `Upgrade-Insecure-Requests` was
+originally set outside the `https:` branch, so a plaintext target got a Chrome UA
+*and* a header Chrome only ever sends from a secure context. `mutation_check.py`
+now carries a `secure-context upgrade header` mutation that fails if it returns.
+
+Coherence inside the `chrome` persona is asserted, not assumed: the major in
+`sec-ch-ua` must equal the major in the User-Agent, and `sec-ch-ua-platform` must
+match the OS the UA claims. A Chrome UA beside a macOS platform hint is a stronger
+tell than saying nothing.
 
 ---
 
@@ -415,20 +638,47 @@ All Workers figures verified verbatim from
 [developers.cloudflare.com/workers/platform/pricing](https://developers.cloudflare.com/workers/platform/pricing/)
 (last updated 2 Oct 2026). Browser Run from section 5.
 
-### 7.1 The two meters that matter
+### 7.1 The meters that matter
 
 | Unit | Included (Paid) | Overage |
 |---|---|---|
 | Requests | 10 million/month | **$0.30** per million |
 | CPU time | 30 million CPU-ms/month | **$0.02** per million CPU-ms |
+| **Workers Logs** | **20 million log events/month** | **$0.60** per million |
 | Subscription | — | **$5.00/month minimum** |
 | Egress / bandwidth | — | **not charged** |
 | Subrequests | — | **not billed** |
 
 That last row matters more than it looks: **the outbound fetch to the origin is
-free**. For a proxy, the entire cost is inbound requests plus CPU. And CPU is
-mostly waiting on I/O, which the docs explicitly exclude: "Waiting on network
-requests (such as `fetch()` calls...) does not count toward CPU time."
+free**. For a proxy, the cost is inbound requests plus CPU plus log events.
+
+**Workers Logs is a real third meter and it was missing from an earlier draft of
+this table, which is why the draft claimed "the entire cost is inbound requests
+plus CPU".** The pricing page, which this table quotes, carries it directly:
+
+> Workers Paid: 20 million included per month, **+$0.60 per additional million**
+
+It is not optional in the way the table's other rows are, because
+`/workers/observability/logs/workers-logs/` states that observability is **on by
+default** for newly created Workers, and `wrangler.toml` did not disable it. At the
+100M-requests/month row that matters most, if each request writes one invocation
+log, 80M events of overage is **+$48.00**, taking **$45.40 to $93.40**. The 1M and
+15M rows sit under the 20M inclusion and are unaffected.
+
+I have **not** measured how many events one proxy request writes, because that
+needs a deployed account. The rate, the allowance and the default-on state are all
+from Cloudflare's own documentation. Either way the cheap fix belongs in the
+deploy config, and it is now there:
+
+```toml
+[observability]
+enabled = false
+```
+
+Set that unless you want Workers Logs, and the meter disappears.
+
+CPU is mostly waiting on I/O, which the docs explicitly exclude: "Waiting on
+network requests (such as `fetch()` calls...) does not count toward CPU time."
 
 That sentence, and the figure below it, are from the **limits** page, not the
 pricing page: "The average Worker uses approximately 2.2 ms per request." The same
@@ -485,17 +735,25 @@ Two caveats on the Free plan that matter more than the price:
 |---|---|---|---|---|
 | Plain proxy / forward fetch | yes | no | **yes** | no (browser only) |
 | Runs JS | yes (Chrome) | yes | **no** | yes |
-| TLS fingerprint control | yes (impersonate) | via local Chrome | **no, impossible** | no |
+| TLS fingerprint control | yes (impersonate) | via local Chrome | **yes, over `connect()`; costs CPU and a transport binding** | no |
 | Real captcha solving | no | agent-driven, needs a real browser | **no** | no |
 | Serverless | Cloud Run + Mongo | no | **yes, native** | yes |
 | Self-host cost @1M req/mo | VM + DB + cache | VM | **$5** | $5 + $0.09/browser-hr |
 
 **Where parity is genuinely achievable at near zero cost**: the proxy role. v2
-matches Jina's *fetch-and-normalise* behaviour minus JS execution, and beats both
-competitors on cost by 2-4 orders of magnitude.
+matches Jina's *fetch-and-relay* behaviour and beats both competitors on cost by
+roughly an order of magnitude against a plain VM, or two against a self-hosted
+Jina with its database and cache. The earlier claim of "2-4 orders of magnitude"
+was unsupported: no dollar figure for either comparator appears anywhere in this
+repository, and 4 orders would require a $50,000/month competitor.
 
-**Where parity is impossible, at any cost**: TLS fingerprinting and captcha
-solving. That is a capability of the network and of a browser, not of code.
+**Where parity is achievable but costs CPU**: the TLS fingerprint. This row was
+"no, impossible" in an earlier draft and that was wrong; section
+[3.3](#33-layer-1-tls-fetch-is-closed-connect-is-not) corrects it. v2 does not
+implement the transport, so today the honest cell is "seam defined, not shipped".
+
+**Where parity is impossible, at any cost**: the egress IP and captcha solving.
+That is a property of the network and of a browser, not of code.
 
 ### 7.4 What adds real money
 
@@ -528,25 +786,35 @@ from arithmetic into a measurement.
 
 ```
 rig/v2.js             the worker (plain JS, no build)
-rig/v1-baseline.js    v1 with a 2-line provenance header, as the negative control
+rig/v1-baseline.js    v1, reformatted, with a 3-line provenance header (see 1)
 wrangler.toml         deploy config
+LICENSE               0BSD
 harness/rig.py        runs a worker under real workerd, with an in-process TAP origin
-harness/test_proxy.py 115 assertions (92 v2 + 16 auth/allowlist + 7 observation)
-                      and 3 negative controls
-harness/mutation_check.py  23 mutations, each required to be caught
-harness/probe_*.py    the four probes behind the timeout findings
+harness/test_proxy.py  172 assertion rows in 6 sections, of which 5 are controls:
+                      120 v2, 10 auth, 7 allowlist, 16 engine/persona, 8 hostlist,
+                      6 v1 observation, 3 NEG-CONTROL, 2 CONTROL
+harness/mutation_check.py  40 mutations, each required to be caught
+harness/probe_raw_socket.py  the Layer 1 measurement: is connect() a raw stream?
+harness/probe_*.py    the five probes: four behind the timeout findings, plus
+                      probe_raw_socket.py behind section 3.3
+tools/ja4.py          JA4 from a raw ClientHello, from first principles
+proofs/01-api-rv-tls.{json,txt}  the live incumbent's TLS fingerprint
+proofs/02-raw-socket.txt         probe_raw_socket.py output, control included
+evidence/bids-*      the b-ids Chrome ClientHello and header order, verbatim
 bin/wd                workerd 2026-10-13 (Cloudflare's actual runtime)
 ```
 
 ### 8.2 Run
 
 ```bash
-python3 harness/test_proxy.py          # <1s
-python3 harness/mutation_check.py      # ~4s, 6 in parallel
+python3 harness/test_proxy.py            # ~2s, 172 assertion rows
+python3 harness/mutation_check.py        # ~8s, 40 mutations, 6 in parallel
+python3 harness/probe_raw_socket.py      # ~0.3s, needs the sandbox CONNECT proxy
 ```
 
-Both exit non-zero on failure. `test_proxy.py` accepts a worker path as `argv[1]`,
-which is how the mutation check runs variants without writing to `rig/v2.js`.
+All three exit non-zero on failure. `test_proxy.py` accepts a worker path as
+`argv[1]`, which is how the mutation check runs variants without writing to
+`rig/v2.js`.
 
 ### 8.3 Why the harness looks unusual
 
@@ -561,6 +829,15 @@ So the harness uses the two workerd features that make this possible anyway:
    `unix:` socket addresses, so inbound requests arrive over AF_UNIX.
 2. `globalOutbound = "tap"` on the Worker — the outbound `fetch()` is routed to an
    **in-process TAP worker** instead of the network.
+
+One more workerd feature matters for section 3.3 and is worth knowing: the
+`Network` struct in `workerd.capnp` carries `allow = ["public"]` by default, which
+is why `connect()` to a loopback or link-local peer fails with
+`connect() blocked by restrictPeers()`. Naming a `network` service with
+`allow = ["public", "private", "local"]` as `globalOutbound` changes that, which
+is how `probe_raw_socket.py` gets a peer that answers. It is a harness
+configuration, not something a deployment on Cloudflare needs: the real edge
+already has egress.
 
 The TAP is what makes this an assertion harness rather than a demo. It receives
 the `Request` the runtime actually built for the upstream call and returns a JSON
@@ -586,16 +863,16 @@ discarded. A suite that cannot fail proves nothing.
 ### 8.5 Mutation check
 
 A negative control proves the harness catches defects that already exist. It does
-**not** prove it would catch a regression introduced into v2. So 23 single-line
+**not** prove it would catch a regression introduced into v2. So 40 single-line
 mutations are applied to a copy of v2, and the suite must fail for each:
 
 ```
-23/23 mutations caught
+40/40 mutations caught
 OK: every mutation was detected, so the v2 assertions have teeth.
 ```
 
-Five mutations were **survivors at some point**, and every one of them found a real
-defect rather than a weak assertion:
+Every mutation was written because something was **caught that should not have
+been**, or **survived that should not have**. There are no decorative entries.
 
 1. **`redirect cap`.** The suite asserted "an infinite loop returns 508". Raising
    `MAX_REDIRECTS` to 500 still returns 508, because a loop is a loop. Fixed by
@@ -608,7 +885,8 @@ defect rather than a weak assertion:
    `looksLikeBotTool(ua)` also matched the *declaration*
    `function looksLikeBotTool(ua)`, producing `function true {`, a syntax error.
    The suite failed, the mutation was scored "caught", and it had pinned nothing.
-   Fixed by anchoring the substitution to the call site.
+   Fixed by anchoring the substitution to the call site, which the persona rewrite
+   then invalidated again, because the call site stopped being an `if`.
 4. **`allowlist label boundary` exposed two harness bugs.** It mutated
    `endsWith("." + want)` to `endsWith(want)`, which really does admit
    `evil-origin.test` — verified against the runtime. The suite still passed,
@@ -618,51 +896,87 @@ defect rather than a weak assertion:
    one **shared** filename, so parallel runs overwrote each other. Both are fixed.
    This is the clearest argument for the mutation check: a green suite and a real
    hole coexisted, and only removing the invariant exposed it.
+5. **`plaintext client hints` survived the persona rewrite**, and it survived for
+   an uncomfortable reason: after `chrome` became gated on `engine=tls`, **no test
+   reached that branch at all**. The suite was green over code that never executed.
+   Fixed by adding section E, which binds a stub `TLS_TRANSPORT` and drives the
+   branch. The general lesson is the one worth keeping: a mutation can survive
+   because an assertion is weak, or because the code it targets is not being
+   exercised, and the two need different fixes.
+6. **`edge persona honesty`** did not exist until section E did. Setting
+   `EDGE_UA = CHROME_UA` was the mutation that introduced the incumbent's own
+   defect into v2, and nothing before would have caught it.
+7. **`secure-context upgrade header`** caught a defect I had just written: see
+   section 6.4.
 
 A surviving mutation is not a nuisance. It is the assertion telling you it was not
 pinning what it claimed.
 
-### 8.6 Two clocks in this harness, and I measured the wrong one first
+### 8.6 Two clocks, and the second one was misreported for a while
 
-**Correction to an earlier draft of this document.** That version reported every
-deadline collapsing to "a flat 5.0 s / 6.0 s" and concluded wall-clock deadlines
-are unobservable here. That was wrong, and the fault was in the **harness**, not
-the runtime: `unix_request` read to EOF, so every measurement included the time the
-client waited for a keep-alive connection to close. Honouring `Content-Length`
-(section 8.7 item 2) changed the numbers completely.
+**Two corrections, both in this section, and the first one is bigger than it looks.**
 
-Re-measured after that fix:
+**Correction 1: the TAP's timers were never clamped.** An earlier draft said
+"the TAP's timers are clamped to ~1 s; `/__ctl/slow?s=20` answers in 1.0 s, so
+the harness cannot simulate a peer slower than ~1 s", and used that as the stated
+reason the production wall-clock deadline is untested. **That was false.** The TAP
+honours its sleep exactly:
+
+```
+/__ctl/slow?s=2   ->  2.00 s
+/__ctl/slow?s=5   ->  5.00 s
+/__ctl/slow?s=10  -> 10.00 s
+/__ctl/slow?s=20  -> 20.00 s
+```
+
+The cause was in the **probes**, not the TAP: all four probe scripts built the TAP
+path from `new URL(request.url).pathname.slice(1)`, which **discards the query
+string**, so `/__ctl/slow?s=20` reached the TAP as `/__ctl/slow` and
+`searchParams.get("s")` read its `|| 1` default. Every "slow peer" row in every
+probe was a 1 s peer, and `probe_timer_semantics.py` STEP 1 printed the question
+"does the PEER's sleep length matter at all?" above four measurements of the same
+1 s peer. Fixed in all four scripts (`pathname.slice(1) + search`); the suite's TAP
+in `rig.py` was always correct.
+
+So the deadline section 8.6 used to defer *is* observable, and with the probes
+fixed it is measured (below). That limitation is withdrawn, not restated.
+
+**Correction 2: the earlier draft's timer numbers came from a buggy client.**
+That version reported every deadline collapsing to a flat ~5 s. That was
+`unix_request` reading to EOF, so each measurement included the wait for a
+keep-alive connection to close. Honouring `Content-Length` (section 8.7 item 2)
+fixed it.
+
+Re-measured after both corrections, with the real workerd:
 
 | Measurement | Result |
 |---|---|
-| Worker's own `AbortController`, budget 250 ms, slow peer | fires at **251, 252, 291 ms** over 3 runs |
-| Own budget 1000 ms, peer that stalls | **aborted** |
-| Own budget 3000 ms, same peer | **completed** |
-| Never-answering peer, no `AbortController` | workerd's hung-code detector, `worker_ms` 1-12 ms |
-| The TAP's own `setTimeout(20_000)` | returns at **1.0 s** |
+| Worker's own `AbortController`, budget 250 ms, peer sleeping 30 s | fires at **252, 252, 254 ms** CPU over 3 runs, always `own-abort` |
+| Own budget 100 ms / 1000 ms / 5000 ms, peer 30 s | aborts at **102 / 1002 / 5001 ms**: elapsed tracks our budget |
+| Own budget 30000 ms, peer 30 s | completes at **30.0 s** |
+| Never-answering peer, no `AbortController` | workerd's hung-code detector at **0 s**, `worker_ms` 0-3 |
 
-So there are two clocks and only one of them is broken:
+So both clocks are sound, and they are sound in different places:
 
-1. **The Worker's timers are accurate.** A 250 ms budget fires at 250 ms. Elapsed
-   time is a usable signal inside the code under test.
-2. **The TAP's timers are clamped to ~1 s.** `/__ctl/slow?s=20` answers in 1.0 s,
-   not 20 s. That is the harness's simulated origin, not v2, so it does not change
-   what v2 does — but the harness **cannot simulate a peer slower than ~1 s**.
+1. **The Worker's timers are exact.** A 250 ms budget fires at 252 ms; a 5 s
+   budget fires at 5001 ms. Elapsed time is a usable signal, both inside the code
+   and at the client.
+2. **workerd's hung-code detector fires immediately on a peer that never
+   answers** (`worker_ms` 0-3), not after ~5 s. An earlier comment saying
+   "cancelled by workerd itself at a fixed ~5 s" was wrong and is corrected.
 
-Consequences, because they bound what the suite proves:
-
-- The suite pins the timeout's **resolution and clamping** at `/__config`, and pins
-  the **abort path** by discriminator rather than by elapsed time. Both remain
-  valid, and the `CONTROL` assertion is what stops "our timeout fired" from
-  being satisfied by workerd's cancel wearing the same status code.
-- A production wall-clock deadline is still untested (Limits item 7).
-
-The discriminator is stable, which is the property the suite relies on:
+The suite pins the timeout's **resolution and clamping** at `/__config` (exact and
+instant) and pins the **abort path** by discriminator rather than by elapsed time.
+The `CONTROL` assertion is what stops "our timeout fired" from being satisfied by
+workerd's detector wearing the same status code, and that discriminator is stable:
 
 ```
 own timer vs SLOW peer     3/3 own-abort
 own timer vs HANGING peer  3/3 runtime-hung-detector
 ```
+
+Both probes are the evidence: `probe_abort_discrimination.py` (above) and
+`probe_timer_semantics.py` (budget-versus-wall table).
 
 ### 8.7 Defects I introduced, and the structural fixes
 
@@ -689,16 +1003,75 @@ wrote patched workers to one shared temp path.
 
 ### 8.8 What a passing mutation check still does not tell you
 
-The 23 mutations are all *behavioural* line edits. They cannot catch:
+The 40 mutations are all *behavioural* line edits. They cannot catch:
 
 - A wrong claim in this document. Nothing here checks prose.
 - A defect that only manifests on the real edge (section 9).
 - A test that asserts the right property of the wrong thing, where no mutation in
   the list happens to touch it.
 - Concurrency. Every test here is single-request and sequential.
+- A **stubbed** transport being correct. Section E proves the plumbing around
+  `TLS_TRANSPORT`, not that a real TLS stack is correct. The stub has no
+  ClientHello and no certificate validation.
 
 The suite proves v2's logic behaves as specified under `workerd`. It does not
 prove v2 is deployed correctly, and it cannot.
+
+### 8.9 The correction that changed the architecture
+
+Recorded here rather than quietly fixed, because it inverted a load-bearing claim.
+
+**What the earlier draft claimed**: TLS fingerprint control is impossible on
+Cloudflare Workers, because `workerd` "offers no per-request TLS API", therefore
+the ClientHello is Cloudflare's and nothing in a Worker can change it.
+
+**What is true**: `connect({ secureTransport: "off" })` from `cloudflare:sockets`
+returns a raw duplex byte stream. Measured under workerd 2026-10-13 in
+`proofs/02-raw-socket.txt`, with the default-config failure kept as a control so
+the positive result is not merely "a socket object exists".
+
+**Where the claim came from, and what happened next.** The correction came from a
+parallel research effort, `nemo-010/b-cf`. Their headline claim was checked rather
+than adopted: I reproduced the mechanism under workerd, and independently
+reproduced their `proofs/01` by curling
+`https://api.rv.pkgforge.dev/https://tls.peet.ws/api/all` and recovering
+`ja4 t13d1312h2_a44d0ee8b3cc_e381dae6da6b` and the `MAX_CONCURRENT_STREAMS = 1`
+SETTINGS frame, which matches what their document records. Their repo is MIT and
+this one is 0BSD, so nothing was copied: the finding and the design were taken, and
+every number was recomputed here. `tools/ja4.py` is written from the JA4 spec
+against the b-ids corpus bytes, and reproduces the reference `ja4_a` (`t13i1516h2`)
+and `ja4_b` (`8daaf6152771`) exactly.
+
+**What did not reproduce, and what that turned out to mean.** Their `ja4_c` of
+`6ff14566cf4a` for the b-ids capture. An earlier revision of this document filed
+that as an unexplained non-reproduction and labelled the field `UNVERIFIED` in
+`tools/ja4.py`. That was the wrong conclusion from the right observation. The
+cause is a rule difference, and it is now isolated:
+
+| rule | extension hash input | sigalgs | b-ids `ja4_c` |
+|---|---|---|---|
+| FoxIO reference, and this repo | sorted, GREASE removed, **`0000` and `0010` removed** | GREASE filtered | `cb7bf5808d99` |
+| The peer tool | sorted, GREASE removed, `0010` **kept** | **not** filtered | `6ff14566cf4a` |
+
+`foxIO-LLC/ja4` `python/common.py` `get_hex_sorted()` removes both `0000` and
+`0010` and `get_signature_algorithms()` filters GREASE, which is what
+`tools/ja4.py` does. The tie-breaker is a third party: `tls.peet.ws` renders its
+own `ja4_r` for the api.rv handshake, whose last two fields *are* the `ja4_c` hash
+input, and its rendered extension list omits `0010`. Hashing peet's own string
+reproduces peet's own `ja4_c` `e381dae6da6b` exactly, which is how `ja4_c` came to
+be **verified rather than unverified**, against an implementation that had no
+reason to agree with mine.
+
+So all three JA4 fields are verified, two of them against the b-ids corpus and
+`ja4_c` against the live capture. The peer tool's value is not wrong for its own
+rule; it is a different rule.
+
+**What changed in the code as a result.** The persona model did not exist before
+this correction. It exists because the corrected picture produced a design
+question the old claim made unaskable: if the ClientHello is ours, then a Chrome
+User-Agent and a non-Chrome handshake are a *mismatch we control*, and the fix is
+to make the layers agree. Section 6.4. The correction did not make v2 stealthier;
+it made v2 honest about a choice it had been making badly by accident.
 
 ---
 
@@ -749,26 +1122,47 @@ Named precisely, because each would otherwise read as settled.
 3. **Header ORDER was captured from the runtime, not from a server's TCP capture.**
    The TAP reads `Headers` iteration order, which is what workerd will serialise,
    but it is not a `tcpdump` of bytes on the wire.
-4. **Egress is blocked in this sandbox**, so "does the edge's TLS stack look like
-   Chrome" is untestable here. This is also the one claim section 3 says is
-   unfixable anyway.
-5. **No anti-bot vendor was tested against.** Section 3 cites Cloudflare's own
+4. **A full TLS handshake was not completed inside workerd.** Section 3.3 proves
+   `connect()` hands over a raw byte stream, which is the property the architecture
+   depends on, but the peer available here is a plaintext HTTP CONNECT proxy, not
+   a TLS origin. So "a Worker completes a TLS 1.3 handshake and gets a JA4 we
+   chose" is **not** demonstrated by this repo. It is not demonstrated here, and
+   reading it as demonstrated would be the same error in the opposite direction.
+   The honest statement is that the transport seam is proven and the transport is
+   not shipped.
+5. **All three JA4 fields are verified, not two.** `tools/ja4.py` reproduces
+   `ja4_a` (`t13i1516h2`) and `ja4_b` (`8daaf6152771`) from the b-ids corpus
+   ClientHello, and `ja4_c` against `tls.peet.ws`'s own computation on the live
+   capture. An earlier revision labelled `ja4_c` `UNVERIFIED`; that was wrong, and
+   the reason is in section 8.9.
+6. **The JS object keys `chromeHeaders()` and `edgeHeaders()` do not exist.** They
+   are prose in a comment describing a decision, not names in the code. Section 6.4
+   and the comment now describe the branches by the header they select on.
+7. **No anti-bot vendor was tested against.** Section 3 cites Cloudflare's own
    documentation for what it inspects. I did not attempt a bypass of any live
    challenge, and the evidence says it would not work.
-6. **Jina and browser-use pricing was not verified first-hand**; I relied on the
+8. **Jina and browser-use pricing was not verified first-hand**; I relied on the
    parallel research for their numbers and verified Cloudflare's myself, since
    Cloudflare's figures are the ones the cost model depends on.
-7. **The upstream timeout's wall-clock behaviour in production is untested.** Its
-   resolution and clamping are proven, and the local Worker's timers are accurate,
-   but the harness cannot simulate a peer slower than ~1 s, so no end-to-end
-   deadline was observed against a genuinely slow origin.
+9. **The upstream timeout's behaviour is now measured, but only against the local
+   runtime.** Section 8.6 was corrected: the old claim that the harness "cannot
+   simulate a peer slower than ~1 s" was false, and with the probes fixed the
+   abort is shown to track its budget exactly (250 ms budget aborts at 252 ms
+   against a 30 s peer). What is still untested is whether the **real Cloudflare
+   edge** honours a deadline the same way, and the Free plan's 10 ms CPU cap
+   against a genuinely slow origin.
+10. **Section E exercises a stub, not a TLS stack.** It proves routing, gating and
+   header coherence around `TLS_TRANSPORT`. It proves nothing about TLS itself.
 
 ## A note on how this was reviewed
 
 Ten independent reviews were run over this document and the code, each with a
 different lens: worker correctness, security adversary, test-suite quality,
 harness fidelity, factual audit, pricing recomputation, overclaim audit,
-regression hunt against v1, deployability, and public-repo readiness.
+regression hunt against v1, deployability, and public-repo readiness. A further
+ten ran after the peer-repo merge and the persona rewrite, described in section
+[8.9](#89-the-correction-that-changed-the-architecture) and at the end of this
+section.
 
 They found four genuine blockers, all now fixed and all confirmed by execution
 rather than by reading:
@@ -800,9 +1194,77 @@ matter more, because a green suite is what makes someone trust a document:
   corrected in place rather than quietly deleted.
 
 Where a reviewer asserted something I could check, I checked it; a few did not
-hold up. The `byte-for-byte` claim on `v1-baseline.js` is now stated as the
-exception it always was (a 2-line provenance header), and the upstream sha256 and
-101-line count are confirmed correct against the downloaded original.
+hold up. The upstream sha256 and 101-line count are confirmed correct against the
+downloaded original. The `byte-for-byte` claim on `v1-baseline.js`, which this
+document also got wrong and then reported as a closed reviewer finding, was false
+in a way that needed fixing in the file's own header; that is done.
+
+### The second round, after the merge
+
+The merge from `nemo-010/b-cf` was reviewed the same way, and the reviews earned
+their keep in the way that matters: by finding things that were wrong rather than
+confirming things that were already believed.
+
+Findings that were fixed:
+
+1. **The `chrome` persona was unreachable by every test.** It existed in the code
+   and nothing executed it, which is how a mutation over that branch survived.
+   Section E exists because of this.
+2. **`Upgrade-Insecure-Requests` was emitted over plaintext `http://`**, beside a
+   User-Agent claiming Chrome, gated by a rule two lines above that said secure
+   contexts only. Fixed, and pinned by a mutation.
+3. **A stale assertion contradicted the new default.** The suite still asserted
+   `still rewrites the UA on a plaintext target` expecting `Chrome` in the value,
+   which is the opposite of what the persona model now does. One line, deleted, and
+   the replacement assertion already covered the behaviour.
+
+A third round of ten ran over the merged result. It found **eight real defects**,
+all now fixed, and they are worth listing because every one of them was a claim the
+suite appeared to cover:
+
+| # | defect | why the suite looked like it covered it |
+|---|---|---|
+| 1 | The caller's `Origin` and `sec-fetch-*` were forwarded verbatim | Nothing asserted on them; v1's leak class was `Referer` and cookies, and `Origin` was simply missed |
+| 2 | Low-entropy Client Hints survived the honest persona | The one assertion sent a caller that had none, so the strip list looked complete |
+| 3 | `X-Proxy-Timeout-Ms` did nothing on `engine=tls` | The transport's init was asserted to be `["headers"]`, which pinned the *absence* of the signal |
+| 4 | An upstream `Access-Control-Allow-Credentials: true` passed through | The fixture never emitted one, and the assertion checked that *we* did not set it |
+| 5 | `access-control-allow-headers` omitted three control headers | The preflight assertions checked status, ACAO and `Vary`, never `allow-headers` |
+| 6 | RFC 6598 CGNAT and NAT64 were not blocked | The 15 covered forms were all loopback/link-local/metadata |
+| 7 | A NUL byte defeated the scheme allowlist | No test used a control character |
+| 8 | `ALLOWED_HOSTS` comma-splitting was unpinned | Every test injected a single clean host, so `split(",")` was never needed |
+
+Plus a **deploy blocker** that no test could catch, because no test reads
+`wrangler.toml`: it set `workers_dev = false` and declared no routes, so
+`wrangler deploy` would have **succeeded and published nothing**. Now fixed, with
+the reason recorded in the file so it is not undone.
+
+Two harness bugs were found alongside them, and both had been hiding a real gap:
+
+- **The control gate only counted one section's controls.** A failing control
+  elsewhere still printed `VALID`. All five are now counted wherever they live.
+- **The Set-Cookie assertion accepted the corruption.** Its first clause was the
+  comma-joined string, and the client used `setdefault()`, so a second cookie was
+  invisible regardless. It now counts lines in the raw response head.
+
+And one of my own tools was wrong in the opposite direction, which is the failure
+mode that matters most here: `tools/ja4.py` labelled `ja4_c` `UNVERIFIED` when in
+fact it was verified and the *peer* tool was using a different rule. Labelling my
+own unverified work honestly was right; concluding from a non-reproduction that
+the cause was unknown, when the cause was a documented rule difference I had not
+checked, was not. See section 8.9.
+
+Findings that were refuted by a second pass, and are reported because a refuted
+finding is still information:
+
+- One review claimed the default persona was a regression in detection terms. It is
+  not, on the evidence: the incumbent's own measured handshake is TLS 1.3 with 13
+  ciphers and 12 extensions while it claims Safari 18.5, and matching the header
+  to the transport is the defensible position. What would be a regression is
+  claiming Chrome over `fetch()`, which is exactly what `chrome` without
+  `engine=tls` now refuses to do.
+- One review claimed the 501 for a missing `TLS_TRANSPORT` was a breaking change
+  for existing callers. It is not reachable by them: `X-Proxy-Engine` is a new
+  header, and no v1 caller sends it.
 
 ## Files I read, and what came of it
 
@@ -814,9 +1276,22 @@ exception it always was (a 2-line provenance header), and the upstream sha256 an
 | `cloudflare/bots/concepts/bot-score`, `/bot-management-variables` | 3.2 |
 | `cloudflare/turnstile/get-started/server-side-validation`, `/troubleshooting/testing` | 3.1 |
 | `cloudflare/workers/runtime-apis/web-standards` | 3.2 |
+| `cloudflare/workers/runtime-apis/tcp-sockets` | 3.3 |
 | `cloudflare/workers/platform/limits` | 3.2, 8 |
 | `cloudflare/workers/changelog/rss/index.xml` | 4.4 |
 | `jina-ai/reader` (`src/services/curl.ts`, `crawler-options.ts`) | 4.1 |
 | `browser-use/browser-use` (`pyproject.toml` history, `profile.py`) | 4.2 |
-| `Azathothas/b-ids` (`lib.rs`, `configs.rs`, `README.md`) | 4.3 |
-| `cloudflare/workerd` releases + `workerd.capnp` | 8.3 |
+| `Azathothas/b-ids` (`lib.rs`, `configs.rs`, `README.md`, corpus ClientHello) | 4.3, 3.3, `tools/ja4.py` |
+| `cloudflare/workerd` releases + `workerd.capnp` (`Network` struct) | 3.3, 8.3 |
+| `nemo-010/b-cf` (MIT) | 3.3, 8.9. Findings and design taken; nothing copied, every number recomputed here |
+| `latentharbor/tunnelfetch`, `EithonX/socksflare` (cited by the peer) | 3.3, prior art for the `TLS_TRANSPORT` binding |
+
+## Attribution and licensing
+
+This tree is **0BSD** (`LICENSE`). The peer research tree it merged findings from,
+`nemo-010/b-cf`, is **MIT**. Nothing was copied between them: the architectural
+findings and the `TLS_TRANSPORT` seam design were taken as ideas and then
+re-derived, and every measurement quoted in section 3.3 was reproduced under
+`workerd` here, from this repo's own probe. `tools/ja4.py` was written from the
+JA4 specification rather than adapted, which is why it independently arrives at
+the same `ja4_a` and `ja4_b` for the same input bytes.

@@ -1,7 +1,7 @@
 // api.rv v2 -- a Cloudflare Workers reverse proxy.
 //
-// Plain ES2022 JavaScript on purpose: no build step, so this file deploys with
-// `wrangler deploy src/worker.js` exactly as written, and runs under workerd
+// Plain ES2022 JavaScript on purpose: no build step, so this file deploys as
+// written (wrangler.toml points `main` at it), and runs under workerd
 // unmodified.
 //
 // Design rule: never claim a capability the Workers runtime does not have.
@@ -101,7 +101,45 @@ function requestTimeoutMs(request) {
 // static one. A real browser has a stable identity per profile.
 const CHROME_MAJOR = 140;
 
-const DEFAULT_UA =
+/**
+ * Two identities, and the difference between them is the whole point.
+ *
+ * The `chrome` persona claims to be Chrome 140. It is used only when the caller
+ * asks for `X-Proxy-Persona: chrome`, which pairs it with a userland TLS
+ * transport.
+ *
+ * The DEFAULT is the honest persona, which describes the transport: it is what
+ * workerd's own `fetch()` presents, so the User-Agent, the negotiated protocol and
+ * the ClientHello agree with each other.
+ *
+ * Why not always claim Chrome? Because the layers move together. Measured on the
+ * live api.rv.pkgforge.dev on 2026-10-13 (proofs/01). Reading the JA4_a fields,
+ * which are `t` + version + sni + ciphers + extensions + alpn:
+ *
+ *   ja4 = t13d1312h2_a44d0ee8b3cc_e381dae6da6b
+ *            ^  ^  ^  ^  ^ ^                      t  13  d 13 12 h2
+ *            |  |  |  |  +-- first ALPN char
+ *            |  |  |  +----- 12 extensions, after GREASE removal
+ *            |  |  +-------- 13 ciphers, after GREASE removal
+ *            |  +----------- d = SNI present
+ *            +-------------- 13 = TLS 1.3   (12 would be TLS 1.2)
+ *
+ * while a real Chrome 155, from the b-ids corpus ClientHello:
+ *
+ *   ja4 = t13i1516h2_8daaf6152771_...   15 ciphers, 16 extensions, no SNI captured
+ *
+ * BOTH are TLS 1.3. An earlier revision of this comment read the "13" as a cipher
+ * count and the "12" as a version and described the incumbent as presenting
+ * TLS 1.2, which was wrong. The gap is narrower and still real: 13 ciphers against
+ * Chrome's 15, 12 extensions against 16, Cloudflare's own HTTP/2 SETTINGS, and a
+ * Safari 18.5 User-Agent. A browser User-Agent on a handshake that is not that
+ * browser's is a *louder* signal than an honest one, because the mismatch is the
+ * tell. Claiming Chrome over `fetch()` inherits exactly that defect; v2 does not.
+ *
+ * If you want the Chrome claim, the transport has to be built to match. See
+ * `engine=tls` in README.md and the Layer 1 section of RESEARCH.md.
+ */
+const CHROME_UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 	`(KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 
@@ -109,6 +147,10 @@ const SEC_CH_UA =
 	`"Chromium";v="${CHROME_MAJOR}", "Not=A?Brand";v="24", "Google Chrome";v="${CHROME_MAJOR}"`;
 
 const SEC_CH_UA_PLATFORM = '"Windows"';
+
+// What the runtime actually is. Sends no sec-ch-ua: those are Client Hints, and
+// inventing them here would be the same overclaim in miniature.
+const EDGE_UA = "Cloudflare-Workers";
 
 const DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9";
 
@@ -225,17 +267,38 @@ function isBlockedHost(hostname) {
 			(a === 169 && b === 254) ||
 			(a === 172 && b >= 16 && b <= 31) ||
 			(a === 192 && b === 168) ||
+			// RFC 6598 shared address space (CGNAT). Carrier NAT equipment and
+			// some metadata endpoints live here, and it is not reachable from
+			// the public internet either.
+			(a === 100 && b >= 64 && b <= 127) ||
+			// RFC 6890 IETF protocol assignments, including 192.0.0.8/32
+			// (IPv4 dummy address) and the 192.0.2.0/24 test range.
+			(a === 192 && b === 0) ||
+			// RFC 2544 benchmarking range, 198.18.0.0/15.
+			(a === 198 && (b === 18 || b === 19)) ||
 			a >= 224
 		) {
 			return true;
 		}
 	}
 	if (/^f[cd][0-9a-f]{2}:/.test(host) || host === "::" || host === "::1") return true;
-	if (/^fe[89ab][0-9a-f]:/.test(host)) return true; // link-local, mapped to 0.0.0.1 above
+	if (/^fe[89ab][0-9a-f]:/.test(host)) return true; // link-local
+	// NAT64 well-known prefix (RFC 6052) 64:ff9b::/96 and its 2001:db8:... variant.
+	// A blocked v4 target is reachable through these as an embedded address, so
+	// blocking only the v4 form would leave the guard trivially bypassable.
+	if (/^64:ff9b:[0-9a-f]*:/.test(host) || host.startsWith("64:ff9b:")) return true;
 	return false;
 }
 
 function validateTarget(candidate, allowedHosts) {
+	// A NUL byte makes `new URL(candidate)` throw, and then the bare-host fallback
+	// below treats the whole string as a host: "ftp://x%00y" parsed directly fails,
+	// but "https://ftp://x%00y" succeeds with host "ftp". That turns a rejected
+	// scheme into a request for a different host than the caller named, so the
+	// input is refused outright rather than repaired.
+	if (/[\u0000-\u001f\u007f]/.test(candidate)) {
+		return { ok: false, status: 400, message: "Invalid target URL" };
+	}
 	let url;
 	try {
 		url = new URL(candidate);
@@ -324,18 +387,25 @@ const EDGE_IDENTITY = new Set([
 	"x-proxy-forward-cookies",
 	"x-proxy-accept-language",
 	"x-proxy-timeout-ms",
-	// Dropped: these are high-entropy Client Hints. A caller's values describe
-	// the caller's own device and would contradict the coherent identity this
-	// proxy builds when it replaces the UA. Chrome withholds them without an
-	// Accept-CH opt-in, so forwarding them is a tell as well as an inconsistency.
-	"sec-ch-ua-arch",
-	"sec-ch-ua-bitness",
-	"sec-ch-ua-model",
-	"sec-ch-ua-full-version",
-	"sec-ch-ua-full-version-list",
-	"sec-ch-ua-platform-version",
-	"sec-ch-ua-wow64",
+	// These describe the caller, not the request being made on the caller's
+	// behalf. Forwarding them tells the origin something about the caller's page
+	// that has nothing to do with this fetch, and `sec-fetch-*` is a description
+	// of a browser navigation that never happened.
+	"origin",
+	"sec-fetch-site",
+	"sec-fetch-mode",
+	"sec-fetch-dest",
+	"sec-fetch-user",
+	// The engine and persona are ours, not the caller's. A caller must not be
+	// able to name an engine that this deployment has no transport bound for.
+	"x-proxy-engine",
+	"x-proxy-persona",
 ]);
+
+// Client Hints are NOT listed in EDGE_IDENTITY, because they are not always
+// ours to drop: see CLIENT_HINTS in buildUpstreamHeaders, which strips them
+// only when the proxy is replacing the User-Agent and would otherwise leave the
+// caller's hints contradicting it.
 
 // Set explicitly by buildUpstreamHeaders, so never copied from the caller.
 // Only user-agent belongs here: accept and accept-language are copied through
@@ -375,37 +445,101 @@ function cookieConsent(request) {
 	return request.headers.get("x-proxy-forward-cookies") === "1";
 }
 
+/**
+ * Which engine this request asked for.
+ *
+ * The TLS transport is bound as `TLS_TRANSPORT` and must expose
+ * `fetch(url, { headers, signal }) -> Response`, the shape a userland TLS + HTTP/2
+ * client provides. The signal is not optional: it is how the per-request timeout
+ * reaches the transport, and a transport that ignores it makes
+ * X-Proxy-Timeout-Ms a no-op.
+ *
+ * It is deliberately NOT implemented here: a correct TLS stack needs its own
+ * test corpus, and shipping a half-audited one behind a stealth claim would be
+ * worse than not offering the option. See RESEARCH.md 3.3 for the design and for
+ * prior art that does ship it.
+ *
+ * `fetch()` is the default and always available. Asking for `tls` with no
+ * transport bound is a clear 501 rather than a silent fallback, because falling
+ * back would return a request that looks like the tier the caller asked for and
+ * is not.
+ */
+const ENGINE_FETCH = "fetch";
+const ENGINE_TLS = "tls";
+
+function requestedEngine(request) {
+	const raw = (request.headers.get("x-proxy-engine") || "").toLowerCase();
+	return raw === ENGINE_TLS ? ENGINE_TLS : ENGINE_FETCH;
+}
+
+// Every Client Hint, low-entropy included. When this proxy builds its OWN
+// identity it owns the whole set; when it forwards the caller's identity the
+// caller's hints belong to that identity and are forwarded with it.
+const CLIENT_HINTS = [
+	"sec-ch-ua",
+	"sec-ch-ua-mobile",
+	"sec-ch-ua-platform",
+	"sec-ch-ua-arch",
+	"sec-ch-ua-bitness",
+	"sec-ch-ua-model",
+	"sec-ch-ua-full-version",
+	"sec-ch-ua-full-version-list",
+	"sec-ch-ua-platform-version",
+	"sec-ch-ua-wow64",
+];
+
 function buildUpstreamHeaders(request, target) {
 	const headers = new Headers();
 	const incoming = request.headers;
 	const forwardCookies = cookieConsent(request);
 
+	const ua = incoming.get("user-agent") || "";
+	const persona = incoming.get("x-proxy-persona") || "edge";
+	const chromePersona = persona === "chrome" && requestedEngine(request) === ENGINE_TLS;
+	// A bot tool arriving with NO User-Agent at all scores an immediate bot
+	// verdict per Cloudflare's bot-score docs, so an empty one is treated as a
+	// bot tool here too rather than forwarded.
+	const overridesIdentity = chromePersona || persona === "edge" && looksLikeBotTool(ua);
+
 	for (const [key, value] of incoming.entries()) {
 		const lower = key.toLowerCase();
 		if (HOP_BY_HOP.has(lower) || EDGE_IDENTITY.has(lower) || OWNED_HEADERS.has(lower)) continue;
 		if (lower === "cookie" && !forwardCookies) continue;
+		// The inconsistency this exists to prevent: the proxy rewrites the UA and
+		// leaves the caller's `sec-ch-ua-platform: "macOS"` beside it. v1 shipped
+		// exactly that combination. A hint only survives when the caller's own UA
+		// is the one going upstream, because then the pair is coherent.
+		if (overridesIdentity && CLIENT_HINTS.includes(lower)) continue;
 		headers.set(key, value);
 	}
 
-	const ua = incoming.get("user-agent") || "";
-	if (looksLikeBotTool(ua)) {
-		// Override with a coherent Chrome identity. Two rules keep this from being
-		// a new inconsistency, which would be worse than v1:
-		//
-		// 1. Only the LOW-entropy hints are sent. Chrome withholds
-		//    sec-ch-ua-arch / sec-ch-ua-bitness / sec-ch-ua-model until the server
-		//    opts in via `Accept-CH`; sending them unprompted is itself a tell.
-		// 2. Nothing is sent over plaintext. Client Hints are a secure-context
-		//    feature, so `http://` targets get the UA and no hints at all.
-		headers.set("user-agent", DEFAULT_UA);
+	if (chromePersona) {
+		// Claim Chrome, and only where the transport can back the claim. Over
+		// plain fetch() the runtime's handshake is Cloudflare's own, which is why
+		// this branch is unreachable without engine=tls.
+		headers.set("user-agent", CHROME_UA);
 		if (target.protocol === "https:") {
+			// Only the LOW-entropy hints. Chrome withholds sec-ch-ua-arch /
+			// -bitness / -model until the server opts in via Accept-CH, and
+			// Client Hints are secure-context only, so http:// targets get none.
 			headers.set("sec-ch-ua", SEC_CH_UA);
 			headers.set("sec-ch-ua-mobile", "?0");
 			headers.set("sec-ch-ua-platform", SEC_CH_UA_PLATFORM);
+			// Same secure-context rule as the hints. A real Chrome sends this
+			// from an https page and never from an http one, so emitting it
+			// alongside a plaintext fetch would contradict the gating two lines
+			// above.
+			headers.set("upgrade-insecure-requests", "1");
 		}
-		headers.set("upgrade-insecure-requests", "1");
-	} else {
+	} else if (persona === "pass" || !looksLikeBotTool(ua)) {
+		// The caller's own identity, forwarded intact. Its hints came with it.
 		headers.set("user-agent", ua);
+	} else {
+		// Default: describe the transport honestly. A caller arriving as curl is
+		// not forwarded as curl, but it is not told it is Chrome either. Silently
+		// claiming a browser identity over a handshake that is not one is worse
+		// than being identifiable, because the mismatch is the signal.
+		headers.set("user-agent", EDGE_UA);
 	}
 
 	// accept and accept-language are copied verbatim when the caller supplied
@@ -441,7 +575,15 @@ function buildUpstreamHeaders(request, target) {
 // has been decompressed; here the body is forwarded untouched, so the framing
 // headers must be preserved or the response is corrupt. Only transfer-encoding is
 // genuinely unsafe to echo.
-const DROP_FROM_RESPONSE = new Set(["transfer-encoding"]);
+const DROP_FROM_RESPONSE = new Set([
+	"transfer-encoding",
+	// The origin's own credential opt-in must not survive. applyCors reflects
+	// the caller's Origin, and pairing a reflected ACAO with a forwarded ACAC is
+	// exactly the combination this proxy's CORS comment says it refuses to
+	// produce: any site could then read a user's authenticated response through
+	// an open target list. Cookie forwarding is the supported, explicit path.
+	"access-control-allow-credentials",
+]);
 
 // An upstream redirect points at the third-party origin. Handing that to the
 // client makes the client bypass the proxy entirely, so rewrite it back into
@@ -495,9 +637,17 @@ function buildResponseHeaders(upstream, proxyOrigin) {
 // proxy: every browser caller fails before reaching the proxy path.
 const CORS_STATIC = {
 	"access-control-allow-methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+	// Every request header this worker actually reads. A preflight only passes if
+	// the header the browser is about to send is listed here, so an omission does
+	// not degrade gracefully: it makes the feature unreachable from a browser
+	// caller, which is the whole point of a CORS proxy. X-Proxy-Engine,
+	// X-Proxy-Persona and X-Proxy-Timeout-Ms were missing here, which silently
+	// disabled the persona model, engine selection and the timeout for every
+	// browser caller.
 	"access-control-allow-headers":
-		"Authorization, Content-Type, X-Proxy-Key, X-Proxy-Accept-Language, " +
-		"X-Proxy-Forward-Cookies, Accept, Accept-Language, User-Agent",
+		"Authorization, Content-Type, Accept, Accept-Language, User-Agent, " +
+		"X-Proxy-Key, X-Proxy-Accept-Language, X-Proxy-Forward-Cookies, " +
+		"X-Proxy-Engine, X-Proxy-Persona, X-Proxy-Timeout-Ms",
 	"access-control-max-age": "86400",
 };
 
@@ -571,6 +721,11 @@ export default {
 					max_redirects: MAX_REDIRECTS,
 					auth_required: authToken !== "",
 					allowed_hosts: allowedHosts,
+					tls_transport_bound: !!(
+						env && env.TLS_TRANSPORT && env.TLS_TRANSPORT.fetch
+					),
+					default_user_agent: EDGE_UA,
+					personas: ["edge", "chrome (requires engine=tls)", "pass"],
 				}, null, 2),
 				{ status: 200, headers: h },
 			);
@@ -584,6 +739,24 @@ export default {
 		const target = parsed.url;
 		const method = request.method.toUpperCase();
 		const hasBody = method !== "GET" && method !== "HEAD";
+
+		// Engine selection. `tls` needs a bound userland transport; without one we
+		// refuse rather than silently serving a fetch(), because a caller that
+		// asked for a Chrome-shaped handshake and got the runtime's own is worse
+		// off than one told no.
+		const engine = requestedEngine(request);
+		const transport = engine === ENGINE_TLS ? (env && env.TLS_TRANSPORT) || null : null;
+		if (engine === ENGINE_TLS && (!transport || typeof transport.fetch !== "function")) {
+			const h = new Headers();
+			applyCors(request, h);
+			return jsonError(
+				501,
+				"engine=tls requires a TLS_TRANSPORT binding exposing " +
+					"fetch(url, {headers, signal}); see RESEARCH.md 3.3. " +
+					"Use the default engine=fetch for the runtime path.",
+				h,
+			);
+		}
 
 		// Follow redirects by hand so each hop gets freshly built headers, the
 		// allowlist and SSRF blocklist apply to EVERY hop, and the final Location
@@ -604,7 +777,14 @@ export default {
 			try {
 				bodyBuffer = await request.arrayBuffer();
 			} catch {
-				bodyBuffer = null; // unpullable body: forward the stream on hop 0 only
+				// The body could not be pulled. It cannot be replayed, so it is
+				// dropped rather than half-sent: a truncated POST that looks
+				// successful is worse than a bodiless one, and 307/308 replay
+				// cannot be honoured without the buffer anyway. An earlier comment
+				// here claimed the stream would be forwarded on hop 0; the code
+				// never did that, because request.body is one-shot and hopBody is
+				// derived only from this buffer.
+				bodyBuffer = null;
 			}
 		}
 
@@ -621,14 +801,32 @@ export default {
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), requestTimeoutMs(request));
 			try {
-				response = await fetch(current.href, {
+				const init = {
 					method: hopMethod,
 					headers: buildUpstreamHeaders(request, current),
 					body: hopBody,
-					redirect: "manual",
 					signal: controller.signal,
-					cf: { cacheTtl: 0 },
-				});
+				};
+				if (transport) {
+					// A userland transport owns its own framing, redirect handling and
+					// TLS, so it gets the target and the headers rather than a
+					// fetch() init. The abort signal is still passed, and it has to
+					// be: without it the controller below aborts nothing and
+					// X-Proxy-Timeout-Ms is silently a no-op on this engine while
+					// /__config reports it as resolved. A transport that cannot honour
+					// a signal must document that, not inherit a deadline that is not
+					// enforced.
+					response = await transport.fetch(current.href, {
+						headers: init.headers,
+						signal: init.signal,
+					});
+				} else {
+					response = await fetch(current.href, {
+						...init,
+						redirect: "manual",
+						cf: { cacheTtl: 0 },
+					});
+				}
 			} catch (err) {
 				clearTimeout(timer);
 				const e = err instanceof Error ? err : new Error(String(err));

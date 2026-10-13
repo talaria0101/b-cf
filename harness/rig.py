@@ -102,6 +102,11 @@ export default {
 				h.set("cf-ray", "injected-by-origin-sim");
 				h.set("cdn-loop", "cloudflare");
 				h.set("x-keep-me", "kept");
+				// An origin that opts the caller into credentialed CORS. The proxy
+				// must not pass this through, because applyCors reflects the
+				// caller's Origin and the pair is the dangerous combination.
+				h.set("access-control-allow-credentials", "true");
+				h.set("access-control-allow-origin", "https://upstream-allowed.test");
 				return new Response("framing-fixture", { status: 200, headers: h });
 			}
 			if (u.pathname === "/__ctl/redirect" || u.pathname === "/__ctl/loop") {
@@ -125,6 +130,16 @@ export default {
 				return new Response(JSON.stringify({ tap: true, seen, chain_end: true }), {
 					status: 200,
 					headers: { "content-type": "application/json", "x-tap": "chain-end" },
+				});
+			}
+			if (u.pathname === "/__ctl/location201") {
+				// A Location on a NON-3xx. The redirect loop only consumes 3xx, so
+				// this is the only shape that reaches rewriteLocation() at all.
+				// A REST origin does exactly this on 201 Created, and a client
+				// that followed it verbatim would leave the proxy entirely.
+				return new Response("created", {
+					status: 201,
+					headers: { location: "https://thirdparty.test/thing", "x-tap": "loc201" },
 				});
 			}
 			if (u.pathname === "/__ctl/relredirect") {
@@ -167,8 +182,14 @@ export default {
 """
 
 
-def unix_request(sock_path, method, path, headers=None, body=None, timeout=15):
-    """Minimal HTTP/1.1 client over an AF_UNIX socket. Returns (status, headers, body)."""
+def unix_request(sock_path, method, path, headers=None, body=None, timeout=15, raw_head=False):
+    """Minimal HTTP/1.1 client over an AF_UNIX socket.
+
+    Returns (status, headers, body), or (status, headers, body, head_text) when
+    raw_head is set. The raw head is the only way to tell two repeated header
+    LINES from one header whose value contains a comma: a joined string is
+    ambiguous, the wire is not.
+    """
     headers = dict(headers or {})
     payload = body.encode() if isinstance(body, str) else (body or b"")
     lines = ["%s %s HTTP/1.1" % (method, path), "Host: proxy.local"]
@@ -203,7 +224,16 @@ def unix_request(sock_path, method, path, headers=None, body=None, timeout=15):
     for line in head_lines[1:]:
         if ":" in line:
             k, v = line.split(":", 1)
-            hdrs.setdefault(k.strip().lower(), v.strip())
+            k = k.strip().lower()
+            v = v.strip()
+            # Repeated headers are JOINED WITH ", " rather than overwritten.
+            # set-cookie is the case that matters: two Set-Cookie lines folded
+            # into one string is indistinguishable from a single comma-joined
+            # cookie, so an assertion about keeping them separate could not fail
+            # against exactly the corruption it was written to catch. Callers
+            # that need the individual values read them back out of the joined
+            # form via _split_repeated().
+            hdrs[k] = (hdrs[k] + ", " + v) if k in hdrs else v
 
     declared = hdrs.get("content-length")
     body = rest
@@ -219,7 +249,21 @@ def unix_request(sock_path, method, path, headers=None, body=None, timeout=15):
             body += chunk
         body = body[:want]
     s.close()
-    return status, hdrs, body.decode("utf-8", "replace")
+    text = body.decode("utf-8", "replace")
+    if raw_head:
+        return status, hdrs, text, head.decode("latin-1")
+    return status, hdrs, text
+
+
+def _split_repeated(joined):
+    """Recover the individual values from a joined repeated header.
+
+    Splitting on "," is only sound for headers whose grammar has no commas
+    inside a value. `set-cookie` is exactly the header where that is false (an
+    Expires date contains commas), so this is used only where the fixture's
+    values are known to be comma-free.
+    """
+    return [p for p in joined.split(", ") if p]
 
 
 def wait_for_unix(path, timeout=25):
@@ -304,8 +348,8 @@ class Rig:
             pass
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def get(self, path, method="GET", headers=None, body=None, timeout=15):
-        return unix_request(self.in_sock, method, path, headers, body, timeout)
+    def get(self, path, method="GET", headers=None, body=None, timeout=15, raw_head=False):
+        return unix_request(self.in_sock, method, path, headers, body, timeout, raw_head)
 
     @staticmethod
     def seen(body_text):

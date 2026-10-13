@@ -1,6 +1,14 @@
-// The v1 baseline, byte-for-byte as published at
-// https://github.com/pkgforge-dev/reverse-proxies/blob/main/api.rv.pkgforge.dev/worker.js
-// This is the NEGATIVE CONTROL for the harness. It is deliberately unmodified.
+// The v1 baseline: the NEGATIVE CONTROL for the harness.
+//
+// Source: https://github.com/pkgforge-dev/reverse-proxies/blob/main/api.rv.pkgforge.dev/worker.js
+// Upstream: 3423 bytes, 101 lines, sha256 3e06a02a0c466b704a1d550167c346102ba2734587e85a68efd1d3d15ef0f6fa
+//
+// This file is a 3-line header plus upstream's code REFORMATTED, not a verbatim
+// copy: indentation was widened from 2 spaces to 4, trailing whitespace was
+// stripped, and the final newline was dropped. Whitespace is not semantic in
+// JavaScript, so the control still exercises exactly the code upstream runs, and
+// that is all a negative control needs. It is NOT byte-for-byte, and an earlier
+// revision of this header claimed it was. RESEARCH.md section 1 states this too.
 export default {
     async fetch(request, env, ctx) {
     // Get the original request URL

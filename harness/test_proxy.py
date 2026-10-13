@@ -13,6 +13,7 @@ Run:  python3 harness/test_proxy.py [path/to/worker.js]
 Exit: 0 = green, 1 = a v2 assertion failed or a control did not fire (harness invalid)
 """
 
+import json
 import os
 import shutil
 import sys
@@ -35,7 +36,7 @@ CHROME_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 # ---------------------------------------------------------------------------
 
 def probe_v1():
-    print("\n=== A/B. v1 baseline (unmodified pkgforge worker.js) ===")
+    print("\n=== A/B. v1 baseline (reformatted pkgforge worker.js) ===")
     r = Results()
     with Rig(V1, "v1") as rig:
         st, hd, body = rig.get("/https://origin.test/hello?a=1&b=2")
@@ -154,11 +155,30 @@ def probe_v2():
             ("link-local IPv6", "https://[fe80::1]/admin"),
             ("unique-local IPv6", "https://[fd00::1]/admin"),
             ("0.0.0.0", "https://0.0.0.0/admin"),
+            # RFC 6598 shared address space. Carrier NAT equipment and some
+            # metadata endpoints live here, and the comment above claims "any
+            # reserved range", so an unlisted reserved block is a gap in both.
+            ("CGNAT 100.64/10", "https://100.100.100.200/latest/meta-data/"),
+            ("CGNAT low edge", "https://100.64.0.1/admin"),
+            ("IETF protocol assignments 192.0.0/24", "https://192.0.0.1/admin"),
+            ("documentation 192.0.2/24", "https://192.0.2.1/admin"),
+            ("benchmark 198.18/15", "https://198.18.0.1/admin"),
+            # RFC 6052 NAT64 embeds a v4 address in a v6 host, so a blocked v4
+            # target stays reachable through the prefix unless it is blocked too.
+            ("NAT64 64:ff9b::/96", "https://[64:ff9b::7f00:1]/admin"),
         ):
             st, _, _ = rig.get("/" + target)
             if not r.check("v2: SSRF guard blocks %s" % label, st == 403,
                            "target=%r status=%s" % (target, st)):
                 break
+
+        # A control byte defeats the scheme check rather than the blocklist: a NUL
+        # makes `new URL(candidate)` throw, and the bare-host fallback then builds
+        # "https://ftp://x" with host "ftp", turning a rejected scheme into a
+        # request for a different host than the caller named.
+        st, _, _ = rig.get("/ftp%3A%2F%2Fevil.test%00/x")
+        r.check("v2: rejects a target containing a NUL byte with 400", st == 400,
+                "status=%s" % st)
 
         # --- header hygiene ---
         st, hd, body = rig.get("/https://origin.test/h", headers={
@@ -174,26 +194,77 @@ def probe_v2():
         r.check("v2: preserves a caller-supplied Accept",
                 h.get("accept") == "application/json", "accept=%r" % h.get("accept"))
 
+        # The caller's Origin and sec-fetch-* describe the caller's PAGE, not the
+        # request being made on the caller's behalf. Forwarding them tells a third
+        # party which internal app relayed the request. v1 leaked Referer and
+        # cookies; Origin was the remaining one, and the CORS response headers this
+        # proxy adds made it look like a deliberate first-party request.
+        st, hd, body = rig.get("/https://origin.test/h", headers={
+            "Origin": "https://secret-internal.corp.example",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-User": "?1",
+        })
+        h = rig.seen(body)["headers"]
+        for hdr in ("origin", "sec-fetch-site", "sec-fetch-mode",
+                    "sec-fetch-dest", "sec-fetch-user"):
+            r.check("v2: does not forward the caller's %s" % hdr, hdr not in h,
+                    "value=%r" % h.get(hdr))
+
         # --- bot-tool UA replacement, with consistent client hints ---
+        # --- persona: the default must NOT claim a browser ---
+        # A browser UA over workerd's own TLS 1.2 handshake is a louder signal
+        # than an honest one, because the mismatch is the tell. proofs/01 measures
+        # the incumbent doing exactly that. The default therefore describes the
+        # transport rather than imitating Chrome.
         st, hd, body = rig.get("/https://origin.test/ua", headers={"User-Agent": "curl/8.22.0"})
         h = rig.seen(body)["headers"]
-        ua = h.get("user-agent", "")
-        r.check("v2: replaces a curl UA", "curl" not in ua, "ua=%r" % ua[:66])
-        r.check("v2: adds sec-ch-ua matching the new UA version",
-                "140" in h.get("sec-ch-ua", ""), "sec-ch-ua=%r" % h.get("sec-ch-ua"))
-        r.check("v2: sec-ch-ua-platform matches the UA's OS",
-                h.get("sec-ch-ua-platform") == '"Windows"' and "Windows NT 10.0" in ua,
-                "platform=%r" % h.get("sec-ch-ua-platform"))
-        r.check("v2: adds upgrade-insecure-requests alongside",
-                h.get("upgrade-insecure-requests") == "1")
-        r.check("v2: sets a browser-like Accept by default",
-                "text/html" in h.get("accept", ""), "accept=%r" % h.get("accept"))
-        r.check("v2: omits an empty sec-ch-ua-model",
-                h.get("sec-ch-ua-model") is None, "value=%r" % h.get("sec-ch-ua-model"))
-
-        r.check("v2: only the low-entropy hints are sent unprompted",
-                "sec-ch-ua-arch" not in h and "sec-ch-ua-bitness" not in h,
+        r.check("v2: does NOT claim Chrome by default",
+                "Chrome" not in h.get("user-agent", "") and "Safari" not in h.get("user-agent", ""),
+                "ua=%r" % h.get("user-agent", ""))
+        r.check("v2: sends no sec-ch-ua on the honest persona",
+                "sec-ch-ua" not in h and "sec-ch-ua-platform" not in h,
                 "hdrs=%s" % sorted(h))
+
+        st, hd, body = rig.get("/http://origin.test/plain", headers={"User-Agent": "curl/8.22.0"})
+        h = rig.seen(body)["headers"]
+        r.check("v2: honest persona sends no client hints over plaintext either",
+                "sec-ch-ua" not in h, "hdrs=%s" % sorted(h))
+        r.check("v2: still replaces a bot-tool UA on a plaintext target",
+                "curl" not in h.get("user-agent", ""),
+                "ua=%r" % h.get("user-agent", ""))
+
+        # persona=pass must forward the caller's UA untouched.
+        st, hd, body = rig.get("/https://origin.test/p", headers={
+            "User-Agent": "curl/8.22.0", "X-Proxy-Persona": "pass"})
+        h = rig.seen(body)["headers"]
+        r.check("v2: persona=pass forwards the caller's UA verbatim",
+                h.get("user-agent") == "curl/8.22.0", "ua=%r" % h.get("user-agent", ""))
+
+        # persona=chrome over the DEFAULT engine must be refused, not honoured.
+        st, hd, body = rig.get("/https://origin.test/c", headers={
+            "User-Agent": "curl/8.22.0", "X-Proxy-Persona": "chrome"})
+        h = rig.seen(body) or {}
+        r.check("v2: persona=chrome is refused without a TLS transport, not silently downgraded",
+                "Chrome" not in str(h.get("headers", {}).get("user-agent", "")),
+                "upstream ua=%r" % h.get("headers", {}).get("user-agent"))
+
+        # engine=tls with no transport bound must be a clear 501.
+        st, hd, body501 = rig.get("/https://origin.test/t", headers={"X-Proxy-Engine": "tls"})
+        r.check("v2: engine=tls without a bound transport returns 501, not a silent fallback",
+                st == 501, "status=%s" % st)
+        r.check("v2: the 501 names the missing binding",
+                "TLS_TRANSPORT" in (body501 or ""), "body=%r" % (body501 or "")[:70])
+
+        # The engine header must not be forwarded to the origin.
+        st, hd, body = rig.get("/https://origin.test/e", headers={
+            "X-Proxy-Engine": "fetch", "X-Proxy-Persona": "edge"})
+        h = rig.seen(body)["headers"]
+        r.check("v2: does not forward x-proxy-engine to the origin",
+                "x-proxy-engine" not in h, "hdrs=%s" % sorted(h))
+        r.check("v2: does not forward x-proxy-persona to the origin",
+                "x-proxy-persona" not in h, "hdrs=%s" % sorted(h))
 
         for tool in ("python-requests/2.32.0", "Go-http-client/1.1", "python-urllib/3.11",
                      "axios/1.7.0", "scrapy/2.11", "okhttp/4.12", "Java/17.0.1"):
@@ -252,14 +323,54 @@ def probe_v2():
         r.check("v2: drops a caller-supplied sec-ch-ua-model that would contradict the UA",
                 h.get("sec-ch-ua-model") is None, "value=%r" % h.get("sec-ch-ua-model"))
 
+        # EVERY hint must go when the proxy replaces the UA. Stripping only the
+        # high-entropy ones left the origin holding a caller-supplied
+        # `sec-ch-ua-platform: "macOS"` beside the proxy's own User-Agent, which is
+        # precisely the incoherent identity this proxy exists to avoid, and it
+        # contradicted the claim that the honest persona sends no hints at all.
+        st, hd, body = rig.get("/https://origin.test/hints", headers={
+            "User-Agent": "curl/8.22.0",
+            "Sec-CH-UA": '"Chromium";v="140"',
+            "Sec-CH-UA-Mobile": "?1",
+            "Sec-CH-UA-Platform": '"macOS"',
+            "Sec-CH-UA-Arch": '"arm"',
+            "Sec-CH-UA-Platform-Version": '"15.0.0"',
+        })
+        h = rig.seen(body)["headers"]
+        leftovers = sorted(k for k in h if k.startswith("sec-ch-"))
+        r.check("v2: drops EVERY caller Client Hint when it replaces the UA",
+                leftovers == [], "left over: %r" % leftovers)
+        r.check("v2: the honest UA stands alone, with no hint contradicting it",
+                h.get("user-agent") == "Cloudflare-Workers",
+                "ua=%r" % h.get("user-agent"))
+
+        # The mirror case: a caller's OWN coherent identity keeps its hints,
+        # because there is nothing left to contradict. persona=pass is the same.
+        st, hd, body = rig.get("/https://origin.test/keep", headers={
+            "User-Agent": CHROME_UA,
+            "Sec-CH-UA": '"Chromium";v="139"',
+            "Sec-CH-UA-Platform": '"macOS"',
+        })
+        h = rig.seen(body)["headers"]
+        r.check("v2: a genuine browser keeps its own matching hints",
+                h.get("sec-ch-ua") == '"Chromium";v="139"'
+                and h.get("sec-ch-ua-platform") == '"macOS"'
+                and h.get("user-agent") == CHROME_UA,
+                "hdrs=%s" % sorted(h))
+        st, hd, body = rig.get("/https://origin.test/keep2", headers={
+            "User-Agent": "curl/8.22.0", "X-Proxy-Persona": "pass",
+            "Sec-CH-UA-Platform": '"macOS"'})
+        h = rig.seen(body)["headers"]
+        r.check("v2: persona=pass keeps the caller's hints, since it keeps their UA",
+                h.get("sec-ch-ua-platform") == '"macOS"',
+                "value=%r" % h.get("sec-ch-ua-platform"))
+
         # Client Hints are a secure-context feature; over http:// Chrome sends none.
         st, hd, body = rig.get("/http://origin.test/plain", headers={"User-Agent": "curl/8.22.0"})
         h = rig.seen(body)["headers"]
         r.check("v2: sends no sec-ch-ua to a plaintext http target",
                 "sec-ch-ua" not in h and "sec-ch-ua-platform" not in h,
                 "hdrs=%s" % sorted(h))
-        r.check("v2: still rewrites the UA on a plaintext target",
-                "Chrome" in h.get("user-agent", ""), "ua=%r" % h.get("user-agent", "")[:52])
 
         # --- CORS ---
         st, hd, _ = rig.get("/https://origin.test/x", headers={"Origin": "https://app.example"})
@@ -281,6 +392,18 @@ def probe_v2():
                 "acao=%r" % hd.get("access-control-allow-origin"))
         r.check("v2: preflight varies on Origin",
                 "origin" in hd.get("vary", "").lower(), "vary=%r" % hd.get("vary"))
+        # A preflight passes only if the header the browser is ABOUT to send is
+        # listed in allow-headers. An omission does not degrade, it disables: the
+        # browser never sends the real request. X-Proxy-Engine, X-Proxy-Persona
+        # and X-Proxy-Timeout-Ms were missing, which silently made the persona
+        # model, engine selection and the timeout unreachable from every browser
+        # caller while the plain assertions above all passed.
+        acah = hd.get("access-control-allow-headers", "").lower()
+        for needed in ("x-proxy-engine", "x-proxy-persona", "x-proxy-timeout-ms",
+                       "x-proxy-key", "x-proxy-forward-cookies",
+                       "x-proxy-accept-language", "authorization", "content-type"):
+            r.check("v2: preflight allows %s, so browsers can use it" % needed,
+                    needed in acah, "acah=%r" % acah)
         st, hd, _ = rig.get("/https://origin.test/x", method="OPTIONS")
         r.check("v2: preflight without an Origin still allows any origin",
                 hd.get("access-control-allow-origin") == "*",
@@ -305,10 +428,22 @@ def probe_v2():
                 "content-encoding=%r" % hd.get("content-encoding"))
         r.check("v2: preserves the body of a framed response",
                 body == "framing-fixture", "body=%r" % body)
-        r.check("v2: keeps both Set-Cookie headers separate, not comma-joined",
-                hd.get("set-cookie") == "a=1; Path=/, b=2; Path=/"
-                or len(hd.get("set-cookie", "").split("a=1")) > 1,
-                "set-cookie=%r" % hd.get("set-cookie"))
+        # Two Set-Cookie header LINES, not one line whose value happens to contain the
+        # same text. Asserted on the raw response head because a joined header
+        # string cannot distinguish the two, which is why an earlier version of
+        # this assertion could not fail: it read the joined value and accepted the
+        # comma-joined corruption as one of its alternatives. The client's
+        # hdrs.setdefault() also kept only the first line, so the second cookie was
+        # invisible to any assertion at all.
+        st, hd, body, head = rig.get("/https://origin.test/__ctl/hdrs", raw_head=True)
+        sc_lines = [ln.split(":", 1)[1].strip()
+                    for ln in head.split("\r\n")
+                    if ln.lower().startswith("set-cookie:")]
+        r.check("v2: keeps both Set-Cookie headers as separate header lines",
+                len(sc_lines) == 2
+                and sc_lines[0] == "a=1; Path=/"
+                and sc_lines[1] == "b=2; Path=/",
+                "lines=%r" % sc_lines)
         r.check("v2: preserves an ordinary upstream header",
                 hd.get("x-keep-me") == "kept", "x-keep-me=%r" % hd.get("x-keep-me"))
         r.check("v2: appends to the origin's Vary rather than clobbering it",
@@ -321,6 +456,30 @@ def probe_v2():
         r.check("v2: does NOT set access-control-allow-credentials",
                 "access-control-allow-credentials" not in hd,
                 "acac=%r" % hd.get("access-control-allow-credentials"))
+        # The origin's OWN ACAC must be dropped, not merely never set by us.
+        # Copying it through while reflecting the caller's Origin produces exactly
+        # the combination the CORS comment says this proxy refuses: any site could
+        # read a user's authenticated response through an open target list.
+        st, hd, _ = rig.get("/https://origin.test/__ctl/hdrs",
+                            headers={"Origin": "https://app.example"})
+        r.check("v2: strips an upstream access-control-allow-credentials",
+                "access-control-allow-credentials" not in hd,
+                "acac=%r" % hd.get("access-control-allow-credentials"))
+        r.check("v2: overrides an upstream access-control-allow-origin with its own",
+                hd.get("access-control-allow-origin") == "https://app.example",
+                "acao=%r" % hd.get("access-control-allow-origin"))
+
+        # --- Location rewriting on a NON-3xx ---
+        # The redirect loop consumes every 3xx-with-Location, so this is the only
+        # shape that reaches rewriteLocation. The assertion below used to check
+        # only the status code, which the follow-everything path satisfies for
+        # free, so a mutant that removed the rewrite passed the whole suite.
+        st, hd, _ = rig.get("/https://origin.test/__ctl/location201")
+        r.check("v2: rewrites a Location on a non-3xx into proxy space",
+                st == 201
+                and hd.get("location", "").endswith("/https://thirdparty.test/thing")
+                and "proxy" in hd.get("location", ""),
+                "status=%s location=%r" % (st, hd.get("location")))
 
         # --- methods and bodies ---
         st, hd, body = rig.get("/https://origin.test/post", method="POST",
@@ -575,7 +734,7 @@ def probe_auth():
                     "status=%s" % st)
 
             st, _, body = rig.get("/__config", headers=AUTH)
-            r.check("auth: /__config requires auth too", st == 200, "status=%s" % st)
+            r.check("auth: /__config is reachable with auth", st == 200, "status=%s" % st)
             import json as _j
             cfg = _j.loads(body)
             r.check("auth: /__config reports that auth is required",
@@ -583,8 +742,278 @@ def probe_auth():
             r.check("auth: /__config reports the effective allowlist",
                     cfg.get("allowed_hosts") == ["origin.test"],
                     "value=%r" % cfg.get("allowed_hosts"))
+
+            # The unauthenticated case, which is the one the previous assertion
+            # was named for but never ran. "Requires auth" is a claim about the
+            # request WITHOUT a credential, not about the request with one.
+            st, _, _ = rig.get("/__config")
+            r.check("auth: /__config is REFUSED without a credential", st == 401,
+                    "status=%s" % st)
     finally:
         shutil.rmtree(os.path.dirname(tmp), ignore_errors=True)
+    return r
+
+
+def probe_tls_engine():
+    """The engine=tls path and the Chrome persona.
+
+    Nothing else in the suite reaches `persona=chrome && engine=tls`: probe_auth
+    binds no transport, so that branch is 501 there, and probe_v2 runs the default
+    engine, so the chrome branch is false. Left alone this whole branch would be
+    unexecuted code whose only "coverage" is an assertion about a 501.
+
+    So bind a STUB transport that records what it was handed and answers. A stub
+    proves the plumbing: which branch runs, what the transport receives, and what
+    the claim looks like once there is a handshake behind it. It does not prove the
+    ClientHello, because a stub has none. RESEARCH.md Layer 1 says so.
+    """
+    print("\n=== E. engine=tls + chrome persona (stub transport bound) ===")
+    r = Results()
+    with open(V2) as fh:
+        text = fh.read()
+
+    stub = (
+        "\t\t// TLS transport stub injected by test_proxy.probe_tls_engine\n"
+        "\t\tenv = Object.assign({ TLS_TRANSPORT: {\n"
+        "\t\t\tfetch(url, init) {\n"
+        "\t\t\t\tconst h = {};\n"
+        "\t\t\t\tfor (const [k, v] of init.headers.entries()) h[k.toLowerCase()] = v;\n"
+        "\t\t\t\tconst payload = {\n"
+        "\t\t\t\t\ttransport: true,\n"
+        "\t\t\t\t\turl: String(url),\n"
+        "\t\t\t\t\theaders: h,\n"
+        "\t\t\t\t\tinit_keys: Object.keys(init || {}),\n"
+        "\t\t\t\t\thas_signal: !!(init && init.signal),\n"
+        "\t\t\t\t};\n"
+        "\t\t\t\treturn Promise.resolve(new Response(JSON.stringify(payload), {\n"
+        "\t\t\t\t\tstatus: 200,\n"
+        "\t\t\t\t\theaders: { 'content-type': 'application/json', 'x-tap': 'tls-transport' },\n"
+        "\t\t\t\t}));\n"
+        "\t\t\t},\n"
+        "\t\t} }, env || {});\n"
+    )
+    patched = text.replace(
+        "async fetch(request, env) {",
+        "async fetch(request, env) {\n" + stub,
+        1,
+    )
+    if patched == text:
+        r.check("tls: the fetch() signature is still patchable", False,
+                "worker.js no longer matches 'async fetch(request, env) {'")
+        return r
+    tmp = os.path.join(tempfile.mkdtemp(prefix="v2-tls-"), "worker.js")
+    with open(tmp, "w") as fh:
+        fh.write(patched)
+
+    def sent(body):
+        try:
+            return json.loads(body)
+        except Exception:
+            return None
+
+    try:
+        with Rig(tmp, "tls") as rig:
+            # 1. The transport branch is reachable and owns the request.
+            st, hd, body = rig.get("/https://origin.test/deep?a=1&b=2",
+                                   headers={"X-Proxy-Engine": "tls"})
+            got = sent(body) or {}
+            r.check("tls: engine=tls routes the request to the bound transport",
+                    st == 200 and got.get("transport") is True
+                    and hd.get("x-tap") == "tls-transport",
+                    "status=%s x-tap=%r" % (st, hd.get("x-tap")))
+            r.check("tls: the transport receives the full target URL, query included",
+                    got.get("url") == "https://origin.test/deep?a=1&b=2",
+                    "transport url=%r" % got.get("url"))
+            # The transport gets the target plus the headers and the abort signal,
+            # NOT a fetch()-shaped init: method/body/redirect/cf belong to the
+            # runtime path only, because a userland transport owns its own framing.
+            #
+            # The signal is part of the contract rather than an optional extra. An
+            # earlier version of this assertion asserted init_keys == ["headers"],
+            # which pinned the absence of the signal and therefore pinned
+            # X-Proxy-Timeout-Ms being a no-op on this engine: the AbortController
+            # had nothing to abort. /__config reported the timeout as resolved, so
+            # the caller was told 250 ms and received none.
+            r.check("tls: the transport gets headers and the abort signal, not a fetch() init",
+                    sorted(got.get("init_keys") or []) == ["headers", "signal"],
+                    "init_keys=%r" % got.get("init_keys"))
+
+            # CONTROL for all three above: the transport is used because the engine
+            # said so, not because it is bound. With the stub present and the engine
+            # left at its default, the runtime fetch() path must still run and the
+            # TAP must be the thing that answers. If these two ever agreed, rows
+            # 1-3 would be measuring the wrong branch.
+            st, hd, body = rig.get("/https://origin.test/deep?a=1")
+            got = sent(body) or {}
+            r.check("CONTROL: a bound transport is NOT used when engine=fetch",
+                    st == 200 and got.get("tap") is True and "transport" not in got,
+                    "x-tap=%r keys=%s" % (hd.get("x-tap"), sorted(got)))
+
+            # 2. /__config must report the binding, so a deployment cannot claim a
+            # TLS tier it does not have.
+            st, _, body = rig.get("/__config")
+            c = sent(body) or {}
+            r.check("tls: /__config reports the transport as bound",
+                    c.get("tls_transport_bound") is True,
+                    "tls_transport_bound=%r" % c.get("tls_transport_bound"))
+
+            # 3. persona=chrome + engine=tls: the full claim, coherently.
+            st, hd, body = rig.get("/https://origin.test/chrome",
+                                   headers={"X-Proxy-Engine": "tls",
+                                            "X-Proxy-Persona": "chrome",
+                                            "User-Agent": "curl/8.22.0"})
+            h = (sent(body) or {}).get("headers", {})
+            ua = h.get("user-agent", "")
+            major = ua.split("Chrome/", 1)[1].split(".", 1)[0] if "Chrome/" in ua else ""
+            r.check("tls: persona=chrome with engine=tls claims Chrome to the origin",
+                    "Chrome/" in ua and "curl" not in ua, "ua=%r" % ua[:56])
+            r.check("tls: the chrome persona emits low-entropy client hints over https",
+                    h.get("sec-ch-ua") is not None
+                    and h.get("sec-ch-ua-platform") is not None,
+                    "hdrs=%s" % sorted(h))
+            # The one invariant that makes a claim useful: every number and every OS
+            # in the set must agree. A UA saying Windows 10 beside a platform hint
+            # saying macOS is a stronger tell than saying nothing at all.
+            r.check("tls: sec-ch-ua major matches the UA's Chrome major",
+                    major != "" and ('v="%s"' % major) in h.get("sec-ch-ua", ""),
+                    "ua_major=%r sec-ch-ua=%r" % (major, h.get("sec-ch-ua", "")[:40]))
+            r.check("tls: sec-ch-ua-platform matches the OS claimed in the UA",
+                    "Windows" in ua and h.get("sec-ch-ua-platform") == '"Windows"',
+                    "ua=%r platform=%r" % (ua[:40], h.get("sec-ch-ua-platform")))
+
+            # 4. The secure-context gate, which the hints obey and which
+            # upgrade-insecure-requests must obey too.
+            st, hd, body = rig.get("/http://origin.test/plain",
+                                   headers={"X-Proxy-Engine": "tls",
+                                            "X-Proxy-Persona": "chrome",
+                                            "User-Agent": "curl/8.22.0"})
+            h = (sent(body) or {}).get("headers", {})
+            r.check("tls: the chrome persona claims Chrome on a plaintext target too",
+                    "Chrome/" in h.get("user-agent", ""),
+                    "ua=%r" % h.get("user-agent", "")[:52])
+            r.check("tls: NO client hints on a plaintext target (secure-context only)",
+                    "sec-ch-ua" not in h and "sec-ch-ua-platform" not in h,
+                    "hdrs=%s" % sorted(h))
+            r.check("tls: NO upgrade-insecure-requests on a plaintext target",
+                    "upgrade-insecure-requests" not in h, "hdrs=%s" % sorted(h))
+            st, hd, body = rig.get("/https://origin.test/sec",
+                                   headers={"X-Proxy-Engine": "tls",
+                                            "X-Proxy-Persona": "chrome"})
+            h = (sent(body) or {}).get("headers", {})
+            r.check("tls: upgrade-insecure-requests IS sent on an https target",
+                    h.get("upgrade-insecure-requests") == "1",
+                    "value=%r" % h.get("upgrade-insecure-requests"))
+
+            # 5. A bound transport does NOT by itself switch the persona on. The
+            # claim stays opt-in, so flipping the persona to always-chrome fails here.
+            st, hd, body = rig.get("/https://origin.test/edge",
+                                   headers={"X-Proxy-Engine": "tls",
+                                            "User-Agent": "curl/8.22.0"})
+            h = (sent(body) or {}).get("headers", {})
+            r.check("tls: engine=tls alone still uses the honest edge persona",
+                    h.get("user-agent") == "Cloudflare-Workers" and "sec-ch-ua" not in h,
+                    "ua=%r" % h.get("user-agent", ""))
+
+            # 6. And the persona is gated on the ENGINE, not on transport
+            # availability: with a transport bound but engine=fetch, the chrome
+            # claim must not fire and the request must go down the runtime path.
+            st, hd, body = rig.get("/https://origin.test/gated",
+                                   headers={"X-Proxy-Persona": "chrome",
+                                            "User-Agent": "curl/8.22.0"})
+            seen = rig.seen(body) or {}
+            h = seen.get("headers", {})
+            r.check("tls: persona=chrome is ignored without engine=tls",
+                    "Chrome" not in h.get("user-agent", ""),
+                    "ua=%r" % h.get("user-agent", ""))
+            r.check("tls: that ignored request went down the runtime fetch() path",
+                    seen.get("url") == "https://origin.test/gated",
+                    "tap url=%r" % seen.get("url"))
+
+            # 7. persona=pass still works under the tls engine, unchanged.
+            st, hd, body = rig.get("/https://origin.test/pass",
+                                   headers={"X-Proxy-Engine": "tls",
+                                            "X-Proxy-Persona": "pass",
+                                            "User-Agent": "curl/8.22.0"})
+            h = (sent(body) or {}).get("headers", {})
+            r.check("tls: persona=pass under engine=tls forwards the caller's UA verbatim",
+                    h.get("user-agent") == "curl/8.22.0",
+                    "ua=%r" % h.get("user-agent", ""))
+    finally:
+        shutil.rmtree(os.path.dirname(tmp), ignore_errors=True)
+    return r
+
+
+def probe_hostlist():
+    """The ALLOWED_HOSTS comma-split contract, with realistic spacing.
+
+    README.md and RESEARCH.md section 9 both tell an operator to write
+    `ALLOWED_HOSTS = "example.com,githubusercontent.com"`. Every other test
+    injects a single clean host, so the split was never exercised: replacing
+    `raw.split(",").map(s => s.trim())` with `[raw]` passed the whole suite, and a
+    deployment following the documented config would get an allowlist containing
+    the literal string "example.com,githubusercontent.com", which matches nothing
+    and 403s everything.
+    """
+    print("\n=== F. ALLOWED_HOSTS parsing (comma-separated, as documented) ===")
+    r = Results()
+    with open(V2) as fh:
+        text = fh.read()
+
+    def build(value, token=None):
+        injected = ("AUTH_TOKEN: %r, ALLOWED_HOSTS: %r" % (token, value)) if token \
+            else ("ALLOWED_HOSTS: %r" % value)
+        patched = text.replace(
+            "async fetch(request, env) {",
+            "async fetch(request, env) {\n\t\t// injected by test_proxy.probe_hostlist\n"
+            "\t\tenv = Object.assign({ %s }, env || {});" % injected,
+            1,
+        )
+        d = tempfile.mkdtemp(prefix="v2-hosts-")
+        path = os.path.join(d, "worker.js")
+        with open(path, "w") as fh:
+            fh.write(patched)
+        return d, path
+
+    # Spaces after the commas, exactly as a human types it.
+    d, path = build("origin.test, other.test", token="s3cret")
+    AUTH = {"X-Proxy-Key": "s3cret"}
+    try:
+        with Rig(path, "hosts") as rig:
+            st, _, body = rig.get("/__config", headers=AUTH)
+            hosts = json.loads(body).get("allowed_hosts")
+            r.check("hosts: splits ALLOWED_HOSTS on commas",
+                    hosts == ["origin.test", "other.test"], "value=%r" % hosts)
+            # The behavioural consequence, which is what a wrong parser causes.
+            st, _, _ = rig.get("/https://origin.test/a", headers=AUTH)
+            r.check("hosts: the FIRST host in the list is reachable", st == 200,
+                    "status=%s" % st)
+            st, _, _ = rig.get("/https://other.test/b", headers=AUTH)
+            r.check("hosts: the SECOND host in the list is reachable", st == 200,
+                    "status=%s" % st)
+            st, _, _ = rig.get("/https://notlisted.test/c", headers=AUTH)
+            r.check("hosts: a host in neither position is still refused", st == 403,
+                    "status=%s" % st)
+            # A subdomain of the SECOND entry proves the trailing element was
+            # trimmed and not left as " other.test".
+            st, _, _ = rig.get("/https://sub.other.test/d", headers=AUTH)
+            r.check("hosts: a subdomain of the second host is permitted", st == 200,
+                    "status=%s" % st)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # The empty and whitespace-only forms mean "no allowlist", which is the
+    # open-proxy default and the reason /__config reports the effective list.
+    for label, value in (("empty", ""), ("whitespace only", "   "),
+                         ("bare commas", " , , ")):
+        d, path = build(value)
+        try:
+            with Rig(path, "hosts2") as rig:
+                st, _, body = rig.get("/__config")
+                hosts = json.loads(body or "{}").get("allowed_hosts")
+                r.check("hosts: an %s ALLOWED_HOSTS means no allowlist" % label,
+                        hosts == [], "value=%r" % hosts)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
     return r
 
 
@@ -596,23 +1025,28 @@ def main():
     v1 = probe_v1()
     v2 = probe_v2()
     auth = probe_auth()
+    tls = probe_tls_engine()
+    hosts = probe_hostlist()
 
-    # The control rows assert that a KNOWN v1 defect IS present. So the harness is
-    # valid when those rows PASS: each one passing means the harness really did
-    # observe the defect. If any control row fails, the defect was not observed,
-    # the harness is not measuring what it claims, and the v2 results prove nothing.
-    controls = [row for row in v1.rows if row[0].startswith("NEG-CONTROL")]
+    # Every control row in the suite, wherever it lives. A control row asserts
+    # that a KNOWN defect or a KNOWN branch-selector IS present, so it is valid
+    # when it PASSES. Scoping this to one section's results (as an earlier
+    # revision did) let a failing control elsewhere print VALID.
+    controls = (
+        [row for row in v1.rows if row[0].startswith("NEG-CONTROL")]
+        + [row for row in v2.rows if row[0].startswith("CONTROL")]
+        + [row for row in tls.rows if row[0].startswith("CONTROL")]
+    )
     controls_ok = bool(controls) and all(row[1] for row in controls)
 
     print("\n=== HARNESS VALIDATION (negative control) ===")
     if controls_ok:
-        print("  VALID: all %d negative-control assertions fired on the unmodified v1."
-              % len(controls))
+        print("  VALID: all %d control assertions fired." % len(controls))
         print("         The harness does observe real defects, so the v2 results below"
               " are meaningful.")
     else:
         bad = [r[0] for r in controls if not r[1]]
-        print("  INVALID: %d/%d negative-control assertions did NOT fire on v1."
+        print("  INVALID: %d/%d control assertions did NOT fire."
               % (len(bad), len(controls)))
         for name in bad:
             print("           did not detect: %s" % name)
@@ -621,7 +1055,9 @@ def main():
 
     v2_ok = v2.summary("v2")
     auth_ok = auth.summary("auth + allowlist")
-    ok = v2_ok and auth_ok and controls_ok
+    tls_ok = tls.summary("engine=tls + chrome persona")
+    hosts_ok = hosts.summary("ALLOWED_HOSTS parsing")
+    ok = v2_ok and auth_ok and tls_ok and hosts_ok and controls_ok
     print("\nOVERALL: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
