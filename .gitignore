@@ -1,0 +1,10 @@
+# Toolchain fetched by the rebuild steps in README.md, not source.
+bin/
+harness/node_modules/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Temporary worker variants written by the test suite
+harness/.v2-authed.js

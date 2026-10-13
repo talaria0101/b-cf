@@ -1,0 +1,15 @@
+name = "api-rv-v2"
+main = "rig/v2.js"
+compatibility_date = "2026-03-24"
+
+# Pins the runtime the proofs in harness/ were run against. Changing this changes
+# behaviour, so change it deliberately and re-run the suite.
+workers_dev = false
+
+# AUTH_TOKEN is a SECRET, not a var. Set it with:
+#   wrangler secret put AUTH_TOKEN
+# With it unset the proxy is open, which is v1's posture.
+
+# Optional. Comma-separated host suffixes. Unset means "any host".
+# [vars]
+# ALLOWED_HOSTS = "example.com,githubusercontent.com"
