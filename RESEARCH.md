@@ -188,8 +188,10 @@ page, verbatim:
 That is decisive, because it means the failure mode is not "headless is slightly
 detectable" but "the recognised automation stacks are classified as bots".
 
-reCAPTCHA is the same shape: the token is valid **two minutes** and single-use,
-acquired from Google's client-side JS in a browser.
+reCAPTCHA is the same shape: the token is single-use and acquired from Google's
+client-side JS in a browser. The commonly cited **two minute** lifetime comes from
+Google's documentation rather than Cloudflare's, so it is outside this document's
+sources and is not verified here. Nothing in this section depends on it.
 
 ### 3.2 What a Worker `fetch()` cannot reproduce
 
@@ -456,11 +458,19 @@ and it is explicitly not a way to send it as one.
 
 ### 4.4 Cloudflare changelog
 
-`https://developers.cloudflare.com/changelog/rss/index.xml`, 8,279,463 bytes,
-**1,341 items**, spanning 2024-02-26 to 2026-10-13. Product tag counts include
-Workers 172, WAF 125, Agents 45, **Browser Run 28**, Workers AI 32, AI Gateway 25.
-Notably **`Browser Rendering` as a product tag: 0 occurrences** — the rename is
-complete.
+`https://developers.cloudflare.com/changelog/rss/index.xml`, **1,344 items** as of
+2026-10-14, spanning 2024-02-26 to 2026-10-13. The 2026-10-13 snapshot this
+section was first written against held 1,341; the feed grows, so a re-run will
+differ by a few items and that is expected.
+
+Product tag counts, counting a tag when it is an item's **FIRST** category rather
+than anywhere in its tag list: Workers 174, WAF 125, Agents 45, **Browser Run 28**,
+Workers AI 32, AI Gateway 26. The method matters and was previously unstated:
+counted as "appears in any category", Workers is 260 rather than 174. The
+load-bearing claim holds under either method.
+
+Notably **`Browser Rendering` as a product tag: 0 occurrences** — the rename to
+Browser Run is complete.
 
 Limits that increased, and that matter for a design:
 
@@ -473,6 +483,12 @@ Limits that increased, and that matter for a design:
 
 No entry in the 150 most recent announces a price **increase** for Workers or
 Browser Run.
+
+**But a pricing change landed that this sweep did not catch.** Workers Logs moves
+to Cloudflare Observability pricing on 2026-12-01 (section 7.1). It appears on the
+pricing page and in a blog post rather than as a Workers-tagged changelog entry, so
+a sweep of the changelog alone misses it. The generalisation is that a pricing
+claim sourced only from the changelog is not a complete survey of pricing.
 
 ---
 
@@ -712,6 +728,28 @@ enabled = false
 
 Set that unless you want Workers Logs, and the meter disappears.
 
+**That meter has an expiry date the table above does not carry.** The same pricing
+page states:
+
+> **Pricing change** — "Beginning December 1, 2026, Workers Logs will use
+> [Cloudflare Observability pricing](https://developers.cloudflare.com/observability/pricing/).
+> Until then, the Workers Logs pricing in this table applies."
+
+The replacement is metered per GB ingested rather than per event, with a different
+allowance. So `$93.40` is a model with an end date: right for the period it
+covers, not the right model from 2026-12-01. That affects the table and not the
+conclusion drawn from it in 7.2, because the config as shipped sets that term to
+zero. Verified 2026-10-14.
+
+**Subrequest ceilings are a limit, not a cost, and they were missing.** The table
+above prices subrequests at nothing, which is right, but the runtime also caps
+them: **50 per invocation on Free, 10,000 per invocation on Paid**, from
+`/workers/platform/limits/`. The same page notes "Each subrequest in a redirect
+chain counts against this limit", which is the line that matters for a proxy that
+follows redirects by hand. `MAX_REDIRECTS + 1` is 6 subrequests at most, which
+sits well inside 50, so the ceiling is not reachable through this worker. Both
+facts are worth stating: the headroom is measured, and the limit exists.
+
 CPU is mostly waiting on I/O, which the docs explicitly exclude: "Waiting on
 network requests (such as `fetch()` calls...) does not count toward CPU time."
 
@@ -728,8 +766,11 @@ Using 7 ms CPU/request, which is the figure in Cloudflare's own worked examples
 
 Two plans, because the binding constraint differs:
 
-**Free plan — 100,000 requests per DAY**, resetting at midnight UTC
-(verified verbatim on both `/workers/platform/limits/` and `/workers/platform/pricing/`).
+**Free plan — 100,000 requests per DAY**. The figure is on both
+`/workers/platform/limits/` and `/workers/platform/pricing/`; the phrase
+"resetting at midnight UTC" is on the limits page only, and the pricing page says
+just `100,000 per day`. (An earlier draft said the whole sentence was verbatim on
+both pages, which was half wrong.)
 
 | Traffic | Cost |
 |---|---|
@@ -758,11 +799,22 @@ Two caveats on the Free plan that matter more than the price:
 
 - **CPU is capped at 10 ms per invocation**, versus 5 minutes on Paid. A proxy
   that must parse, buffer and re-emit headers sits near that on a slow origin.
-- **Exceeding the daily cap returns Error 1027, and the default route mode is
-  "fail open"**: "Bypasses the Worker. Requests behave as if no Worker is
-  configured." For this proxy that means auth and header rewriting are skipped
-  entirely for the overflow traffic. Set the route to **fail closed** before using
-  the Free plan, or a traffic spike silently disables the control you added.
+- **Exceeding the daily cap returns Error 1027, and the route mode decides what
+  happens.** Both documented modes, quoted from `/workers/platform/limits/`:
+
+  > | Fail open | Bypasses the Worker. Requests behave as if no Worker is configured. |
+  > | Fail closed | Returns a Cloudflare `1027` error page. Use this for security-critical Workers. |
+
+  Under **fail open**, auth and header rewriting are skipped entirely for the
+  overflow traffic, so a traffic spike silently disables the control. Set the
+  route to **fail closed** before using the Free plan.
+
+  **Which mode is the default is not stated anywhere in Cloudflare's
+  documentation**, so this document does not claim it: the limits page shows both
+  in a table with no default marked, and neither does the routing documentation.
+  Check it in the dashboard, `Workers & Pages > worker > Settings > Triggers`.
+  (An earlier draft asserted "fail open" is the default. That assertion was
+  unverifiable, so it has been removed rather than softened.)
 
 ### 7.3 Feature parity and cost versus each comparator
 
@@ -1176,9 +1228,11 @@ visible rather than silent.
 the proofs ran against. `wrangler.toml` pins the same value so a deploy does not
 silently pick up a different runtime than the one that was tested.
 
-**Set the route's failure mode to closed.** Cloudflare's default is "fail open",
-which skips the Worker entirely when the Free plan's daily cap is exceeded,
-skipping auth and header rewriting for the overflow.
+**Check the route's failure mode.** Under "fail open" the Worker is skipped
+entirely once the Free plan's daily cap is exceeded, so auth and header rewriting
+stop applying to the overflow traffic. Under "fail closed" the caller gets an
+error instead. Set it to fail closed. Cloudflare's documentation does not say which
+is the default; see section 7.2.
 
 ---
 
@@ -1271,6 +1325,49 @@ did not hold up. The upstream sha256 and 101-line count are confirmed correct ag
 downloaded original. The `byte-for-byte` claim on `v1-baseline.js`, which this
 document also got wrong and then reported as a closed reviewer finding, was false
 in a way that needed fixing in the file's own header; that is done.
+
+### The third round, after the neutral-register rewrite
+
+Eight further lenses, run over the same tree. The code defects they found are
+listed in section 6.2 and fixed with assertions; what is worth recording here is
+the pricing lens, because it found a defect in this document rather than in the
+worker.
+
+Every pricing and limit claim was recomputed against Cloudflare's own
+documentation, fetched 2026-10-14. Of 51 claims checked, 41 matched exactly,
+including every headline figure: $0.30/M requests, $0.02/M CPU-ms, $0.60/M log
+events, the $5.00 minimum, Cloudflare's own worked examples at $8.00 and $45.40,
+100,000 requests/day, Error 1027, 10 ms Free CPU, $0.09/browser-hour, 64 MiB, the
+20-minute runtime-update grace period, 6 MiB Markdown-for-Agents, and the 300-second
+Turnstile lifetime. The remaining findings, all now corrected in place:
+
+- **A dated pricing change was missing.** Workers Logs moves to Cloudflare
+  Observability pricing on 2026-12-01, and the $93.40 figure in 7.1 is a model
+  that stops applying on that date. The notice is quoted in 7.1 now.
+- **An unverifiable default was asserted as fact.** Section 7.2 claimed "the
+  default route mode is fail open". Cloudflare's limits page shows both modes in a
+  table with no default marked, and nothing else in their documentation states it
+  either. The claim is removed rather than softened, and the operator is told where
+  to check. Section 9 depended on it.
+- **A quotation was attributed to two sources and exists on one.** The Free-plan
+  daily limit is on both the limits and pricing pages; "resetting at midnight UTC"
+  is on the limits page only.
+- **Three numbers had drifted by days.** The changelog feed holds 1,344 items
+  against the 1,341 recorded, and the tag counts moved with it. The counting method
+  was also unstated and mattered: "first category" gives Workers 174, "appears in
+  any category" gives 260. The method is now written down.
+- **An omission with teeth.** Subrequests are priced at nothing, correctly, but the
+  runtime also caps them at 50 per invocation on Free and 10,000 on Paid, counting
+  each redirect hop. Section 7.1 now states the ceiling and the measured headroom.
+- **One claim was outside its own sources.** The reCAPTCHA two-minute lifetime comes
+  from Google, not Cloudflare, so it cannot be verified from the sources this
+  document cites. Marked as such.
+
+The generalisable lesson, and the reason it is written down rather than just
+fixed: the 4.4 sweep looked for price *increases* in the changelog and found none.
+The Workers Logs change is a pricing change, and it reached the docs through the
+pricing page and a blog post rather than a Workers-tagged changelog entry. A
+pricing claim sourced only from the changelog is not a survey of pricing.
 
 ### The second round, after the merge
 
@@ -1367,3 +1464,11 @@ re-derived, and every measurement quoted in section 3.3 was reproduced under
 `workerd` here, from this repo's own probe. `tools/ja4.py` was written from the
 JA4 specification rather than adapted, which is why it independently arrives at
 the same `ja4_a` and `ja4_b` for the same input bytes.
+
+That "nothing was copied" claim is an assessment, not a measurement, so the
+remedy is written down while it is still true to state. If it is ever found to be
+wrong, the obligation that attaches is MIT's notice clause, and the fix is
+mechanical: quote the copyright and permission notice from the upstream `LICENSE`
+into the affected files. The upstream is `github.com/nemo-010/b-cf`. Writing the
+remedy now means a later correction does not first have to rediscover that the two
+trees were ever related.
