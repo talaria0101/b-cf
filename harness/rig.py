@@ -157,6 +157,41 @@ export default {
 			if (u.pathname === "/__ctl/status") {
 				return new Response("scripted " + code, { status: code });
 			}
+			// A 304 carrying a Location. RFC 9110 s15.4.5 gives a 304 a Location to
+			// name the selected representation, and 304 is not a redirect: it has
+			// no body and cannot be fetched. A proxy that treats it as one throws
+			// away the client's conditional headers and answers with a bodyless 200.
+			if (u.pathname === "/__ctl/notmodified") {
+				return new Response(null, {
+					status: 304,
+					headers: { location: "/__ctl/relative-target", etag: '"v1"',
+						"x-tap": "notmodified" },
+				});
+			}
+			// Vary: *. Not a list of header names: it is the value that means
+			// "uncacheable, do not key on anything". Appending ", Origin" to it
+			// produces a header RFC 9110 s5.2.2 does not define.
+			if (u.pathname === "/__ctl/varystar") {
+				return new Response("vary-star", {
+					status: 200, headers: { vary: "*", "x-tap": "varystar" },
+				});
+			}
+			// A 302 whose Location names a DIFFERENT host, so the redirect leaves
+			// the host the caller consented to. Cookie consent is scoped to that
+			// host and must not follow the redirect.
+			if (u.pathname === "/__ctl/crosshost") {
+				return new Response("crosshost", {
+					status: 302,
+					headers: { location: to, "x-tap": "crosshost" },
+				});
+			}
+			// Same host, different path: consent MUST survive, or the scoping
+			// check below passes for the wrong reason.
+			if (u.pathname === "/__ctl/samehost") {
+				return new Response("samehost", {
+					status: 302, headers: { location: to, "x-tap": "samehost" },
+				});
+			}
 			if (u.pathname === "/__ctl/hang") {
 				await new Promise(() => {});
 			}
@@ -190,13 +225,33 @@ def unix_request(sock_path, method, path, headers=None, body=None, timeout=15, r
     LINES from one header whose value contains a comma: a joined string is
     ambiguous, the wire is not.
     """
-    headers = dict(headers or {})
+    headers = {k: v for k, v in (headers or {}).items() if v is not None}
     payload = body.encode() if isinstance(body, str) else (body or b"")
-    lines = ["%s %s HTTP/1.1" % (method, path), "Host: proxy.local"]
+    lines = ["%s %s HTTP/1.1" % (method, path)]
+
+    def _take(name):
+        """Remove a header by case-insensitive name and return its value."""
+        found = None
+        for k in list(headers):
+            if k.lower() == name:
+                found = headers.pop(k)
+        return found
+
+    # Host and Content-Length are emitted by this client and have to be
+    # suppressible. With no way to remove them, the case "a caller-supplied Host
+    # is replaced, not forwarded" cannot be written at all: this client's line
+    # and the caller's line would both reach the wire, workerd rejects a request
+    # carrying a duplicate Host, and the resulting 500 is indistinguishable
+    # from the proxy failing the thing under test. Passing the header as None
+    # omits the line; passing a value sends the caller's value instead.
+    host = _take("host")
+    lines.append("Host: %s" % (host if host is not None else "proxy.local"))
+    declared_length = _take("content-length")
+
     for k, v in headers.items():
         lines.append("%s: %s" % (k, v))
     if body is not None:
-        lines.append("Content-Length: %d" % len(payload))
+        lines.append("Content-Length: %s" % (declared_length or len(payload)))
     raw = ("\r\n".join(lines) + "\r\n\r\n").encode() + payload
 
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -350,6 +405,9 @@ class Rig:
 
     def get(self, path, method="GET", headers=None, body=None, timeout=15, raw_head=False):
         return unix_request(self.in_sock, method, path, headers, body, timeout, raw_head)
+
+    def post(self, path, headers=None, body=None, timeout=15):
+        return unix_request(self.in_sock, "POST", path, headers, body, timeout)
 
     @staticmethod
     def seen(body_text):

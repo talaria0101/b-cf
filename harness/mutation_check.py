@@ -113,8 +113,10 @@ MUTATIONS = [
     ),
     (
         "private-range blocking",
-        r'\t\tif \(\n\t\t\ta === 0 \|\| a === 10 \|\| a === 127 \|\|',
-        '\t\tif (\n\t\t\tfalse ||',
+        r'\t\ta === 0 \|\|                                   // 0\.0\.0\.0/8, "this network"\n'
+        r'\t\ta === 10 \|\|                                  // RFC 1918\n'
+        r'\t\ta === 127 \|\|                                 // loopback\n',
+        '\t\tfalse ||\n',
         "blocking RFC1918 and loopback IPv4 ranges",
     ),
     (
@@ -225,10 +227,31 @@ MUTATIONS = [
         "dropping every caller Client Hint when the User-Agent is replaced",
     ),
     (
+        # The v4 rules moved into isBlockedV4() when the 6to4 path needed to ask
+        # them the same question about an address unpacked out of an IPv6 one.
         "CGNAT and reserved ranges",
-        r'\t\t\t\(a === 100 && b >= 64 && b <= 127\) \|\|\n',
+        r'\t\t\(a === 100 && b >= 64 && b <= 127\) \|\|        // RFC 6598 CGNAT\n',
         '',
         "blocking RFC 6598 100.64/10, which is not publicly routable either",
+    ),
+    (
+        # 2002:a9fe:a9fe:: is 169.254.169.254 and 2002:7f00:1:: is 127.0.0.1.
+        # With the v4 rules consulted only on the dotted-quad form, a 6to4 address
+        # reached the metadata endpoint and loopback with the guard switched off,
+        # which is the whole reason the v4 rules were factored out.
+        "6to4 embedded IPv4",
+        r'\tif \(g0 === 0x2002 && isBlockedV4\(g1 >> 8, g1 & 255, g2 >> 8, g2 & 255\)\) return true;',
+        '\tif (false) return true;',
+        "blocking a 6to4 address whose embedded IPv4 is a blocked target",
+    ),
+    (
+        # Without this the ::/8 rule is absent, so ::1 and :: normalise past every
+        # check. It also covers the deprecated IPv4-compatible form, which
+        # normalizeHost no longer folds to a dotted quad.
+        "IPv6 ::/8 reserved",
+        r'\tif \(g\.slice\(0, 5\)\.every\(\(n\) => n === 0\) && g\[5\] === 0\) return true;',
+        '',
+        "blocking the IPv6 unspecified and loopback addresses",
     ),
     (
         "NUL byte in target",
@@ -240,9 +263,28 @@ MUTATIONS = [
         # The only shape that reaches rewriteLocation at all, since the redirect
         # loop consumes every 3xx-with-Location.
         "Location rewrite on non-3xx",
-        r'\t\treturn proxyOrigin \+ "/" \+ u\.href;',
-        '\t\treturn location;',
+        r'\treturn proxyOrigin \+ "/" \+ resolved\.href;',
+        '\treturn location;',
         "rewriting a Location on a non-3xx into proxy space",
+    ),
+    (
+        # Resolving against the base is what makes a relative or protocol-relative
+        # Location safe. With no base, `new URL("/next")` throws and
+        # `new URL("//evil.test/x")` reads evil.test as the host, so both shapes
+        # were handed to the client verbatim and the client left the proxy.
+        "Location resolved against its base",
+        r'\t\tresolved = base \? new URL\(location, base\) : new URL\(location\);',
+        '\t\tresolved = new URL(location);',
+        "resolving a relative or protocol-relative Location against the hop it came from",
+    ),
+    (
+        # 304 carries a Location naming the selected representation, not a
+        # redirect. Treating it as one discarded the client's conditional headers
+        # and answered with a bodyless 200 instead of the 304.
+        "304 is not a redirect",
+        r'\t\t\t\tstatus === 307 \|\| status === 308;',
+        '\t\t\t\tstatus === 307 || status === 308 || status === 304;',
+        "returning a 304 to the client instead of consuming it as a redirect hop",
     ),
     (
         # X-Proxy-Timeout-Ms was a no-op on engine=tls: the AbortController had
@@ -294,6 +336,69 @@ MUTATIONS = [
         r'\t\t\tfor \(const c of cookies\) out\.append\("set-cookie", c\);',
         '\t\t\tout.set("set-cookie", cookies.join(", "));',
         "keeping repeated Set-Cookie headers as separate header lines",
+    ),
+    # --- round 3: the ten review lenses. Same shape: one invariant per entry. ---
+    (
+        # Consent is per request, and a request names ONE host. Checked once
+        # against hop 0, it rode a 302 to whatever host the origin chose, which is
+        # the leak the opt-in exists to bound.
+        "cookie consent is host-scoped",
+        r'\treturn normalizeHost\(targetHost\) === normalizeHost\(initialHost\);',
+        '\treturn true;',
+        "scoping cookie consent to the host the caller named",
+    ),
+    (
+        # `Vary: *` is the value that means "do not key on anything", not a list
+        # of names. Appending produces "*, Origin", which RFC 9110 s5.2.2 does not
+        # define and caches cannot parse.
+        "Vary star not appended to",
+        r'\tif \(existing === "\*"\) \{\n\t\theaders\.set\("vary", "\*"\);',
+        '\tif (false) {\n\t\theaders.set("vary", "*");',
+        "leaving an upstream Vary: * alone instead of producing '*, Origin'",
+    ),
+    (
+        # RFC 9110 s15.5.2 makes WWW-Authenticate REQUIRED on a 401, and this proxy
+        # accepts two schemes, so a client has nothing to read without it.
+        "401 carries a challenge",
+        r'\t\t\th\.set\("www-authenticate", \'Bearer realm="proxy", charset="UTF-8"\'\);',
+        '',
+        "the WWW-Authenticate challenge on an unauthenticated request",
+    ),
+    (
+        # url.hostname never carries a port, so an entry that keeps its port matches
+        # nothing: a deployment that wrote `origin.test:8443` had an allowlist that
+        # permitted nothing and 403ed every request.
+        "allowlist entry port is stripped",
+        r'\t\t\tconst want = normalizeHost\(stripPort\(s\)\);',
+        '\t\t\tconst want = normalizeHost(s);',
+        "tolerating a port in an ALLOWED_HOSTS entry instead of matching nothing",
+    ),
+    (
+        # The flag decides whether the caller's hints survive. It was
+        # `persona === "edge" && looksLikeBotTool(ua)`, false for persona=chrome
+        # arriving without engine=tls, which then fell through to the edge UA with
+        # the caller's Client Hints still attached.
+        "identity override covers every rewrite",
+        r'\t\tchromePersona \|\| \(persona !== "pass" && looksLikeBotTool\(ua\)\);',
+        '\t\tchromePersona || (persona === "edge" && looksLikeBotTool(ua));',
+        "dropping the caller's Client Hints whenever the User-Agent is replaced",
+    ),
+    (
+        # A POST on engine=tls reached the origin with no payload and the origin's
+        # 200 came back as success. Without the refusal, the guard is off and the
+        # write is silently dropped.
+        "engine=tls refuses a bodied request",
+        r'\t\tif \(transport && hasBody && transport\.supportsBody !== true\) \{',
+        '\t\tif (false) {',
+        "refusing a bodied request when the transport cannot send a body",
+    ),
+    (
+        # The other half of that pair: the method and body must actually reach a
+        # transport that says it can send them.
+        "engine=tls forwards method and body",
+        r'\t\t\t\t\t\tmethod: hopMethod,\n\t\t\t\t\t\theaders: init\.headers,\n\t\t\t\t\t\tbody: hopBody,\n\t\t\t\t\t\tsignal: init\.signal,',
+        '\t\t\t\t\t\theaders: init.headers,\n\t\t\t\t\t\tsignal: init.signal,',
+        "passing method and body to a body-capable TLS_TRANSPORT",
     ),
 ]
 

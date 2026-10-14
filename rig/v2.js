@@ -210,8 +210,13 @@ function parseTarget(request, allowedHosts) {
  * leaves a trailing dot on `localhost.`, which `endsWith(".localhost")` misses.
  * Both were confirmed gaps before this function existed.
  *
- * IPv4-mapped and IPv4-compatible IPv6 (`::ffff:a.b.c.d`, `::a.b.c.d`) are
- * folded to the dotted quad, because they are the same host.
+ * IPv4-mapped addresses (`::ffff:a.b.c.d`) are folded to the dotted quad, because
+ * they are the same host and the v4 rules already cover them.
+ *
+ * The deprecated IPv4-compatible form (`::a.b.c.d`) is deliberately NOT folded.
+ * Folding it is what made `::1` normalise to `0.0.0.1`, which reads as a
+ * coincidence: it was blocked for the wrong reason, and the whole `::/8` had no
+ * rule of its own. isBlockedV6 blocks `::/8` outright instead.
  */
 function expandIPv6(inner) {
 	let s = inner;
@@ -242,7 +247,7 @@ function normalizeHost(hostname) {
 			const groups = expandIPv6(inner);
 			if (groups.length === 8) {
 				const zeroPrefix = groups.slice(0, 5).every((g) => g === 0);
-				if (zeroPrefix && (groups[5] === 0xffff || groups[5] === 0)) {
+				if (zeroPrefix && groups[5] === 0xffff) {
 					return `${groups[6] >> 8}.${groups[6] & 255}.${groups[7] >> 8}.${groups[7] & 255}`;
 				}
 				return groups.map((g) => g.toString(16)).join(":");
@@ -253,40 +258,136 @@ function normalizeHost(hostname) {
 	return s;
 }
 
+/**
+ * Drop the `:port` suffix from an allowlist entry, leaving the host.
+ *
+ * The two colons of a bare IPv6 literal are part of the address, so "port" is
+ * only removed when the shape is unambiguous:
+ *
+ *   origin.test        no colon            -> host as written
+ *   origin.test:8443   one colon           -> strip the trailing digits
+ *   [::1]:8443         bracketed           -> keep the bracket contents
+ *   ::1                several colons      -> an address, not a port
+ *
+ * Counting colons is what makes this safe. Stripping after the LAST colon, which
+ * is the obvious implementation, turns `2001:db8::1` into `2001:db8:` and
+ * silently allows nothing.
+ */
+function stripPort(entry) {
+	const s = String(entry).trim();
+	if (s.startsWith("[")) {
+		const close = s.indexOf("]");
+		return close === -1 ? s : s.slice(1, close);
+	}
+	if (s.indexOf(":") === -1) return s;
+	if (s.indexOf(":") !== s.lastIndexOf(":")) return s; // bare IPv6 literal
+	return /^\d+$/.test(s.slice(s.indexOf(":") + 1)) ? s.slice(0, s.indexOf(":")) : s;
+}
+
+/**
+ * Every IPv4 octet address that must not be reachable through the proxy.
+ *
+ * The three rules are: the whole of 0/8 and 127/8, the private ranges, and every
+ * reserved or special-purpose assignment. It is written as a predicate rather
+ * than a list of strings so that the 6to4 path below can ask the same question of
+ * an address it has just unpacked out of an IPv6 address.
+ */
+function isBlockedV4(a, b, c, d) {
+	return (
+		a === 0 ||                                   // 0.0.0.0/8, "this network"
+		a === 10 ||                                  // RFC 1918
+		a === 127 ||                                 // loopback
+		(a === 100 && b >= 64 && b <= 127) ||        // RFC 6598 CGNAT
+		(a === 169 && b === 254) ||                  // link-local, incl. metadata endpoints
+		(a === 172 && b >= 16 && b <= 31) ||         // RFC 1918
+		(a === 192 && b === 0 && c === 0) ||          // RFC 6890 special use, incl. 192.0.0.8/32
+		(a === 192 && b === 0 && c === 2) ||          // TEST-NET-1
+		(a === 192 && b === 88 && c === 99) ||        // 6to4 relay anycast, deprecated
+		(a === 192 && b === 168) ||                  // RFC 1918
+		(a === 198 && (b === 18 || b === 19)) ||     // RFC 2544 benchmarking
+		(a === 198 && b === 51) ||                   // TEST-NET-2
+		(a === 203 && b === 0) ||                    // TEST-NET-3
+		a >= 224                                      // multicast, reserved, broadcast
+	);
+}
+
+/**
+ * Every IPv6 prefix that must not be reachable, plus the two that embed an IPv4
+ * address and need it unpacked before the v4 rules can be applied.
+ *
+ * `host` is a normalised address: lowercase hex, no brackets, eight groups
+ * joined by ":".
+ *
+ * This is a prefix list, not a claim of completeness over all reserved space. It
+ * covers every prefix that either is unroutable, or routes to something internal,
+ * or embeds a v4 address that the v4 rules would have caught. Prefixes that only
+ * carry publicly-routable traffic are deliberately absent.
+ */
+function isBlockedV6(host) {
+	const g = host.split(":").map((x) => parseInt(x || "0", 16));
+	// Not eight parsable groups. normalizeHost only emits this shape for a
+	// bracketed literal, so this should be unreachable; returning false keeps a
+	// malformed value from reading as blocked and hiding a real fetch failure.
+	if (g.length !== 8 || g.some((n) => !Number.isFinite(n))) return false;
+	const [g0, g1, g2, g3] = g;
+
+	// ::/8. Covers ::, ::1, and the deprecated IPv4-compatible form ::a.b.c.d.
+	// normalizeHost does not fold this to a dotted quad, precisely because ::1 is
+	// not 0.0.0.1.
+	if (g.slice(0, 5).every((n) => n === 0) && g[5] === 0) return true;
+
+	// RFC 6052 NAT64 well-known prefix 64:ff9b::/96, and RFC 8215 local-use
+	// 64:ff9b:1::/48. Both embed a v4 address in the low 32 bits, so a blocked v4
+	// target is reachable through them. The /32 covers both listed prefixes; a
+	// network-specific prefix outside 64:ff9b::/32 cannot be enumerated and is
+	// not covered.
+	//
+	// The previous version tested the string prefix "64:ff9b:" against the
+	// normalised host. That was not wrong: normalizeHost re-renders every group
+	// unpadded, so 0064:ff9b:: normalises to 64:ff9b: and still matched, and no
+	// legal spelling of this prefix hides the colon between the first two groups
+	// because an IPv6 group is at most four hex digits. The numeric form is kept
+	// because it sits with the other prefix checks and needs no such argument.
+	if (g0 === 0x0064 && g1 === 0xff9b) return true;
+
+	// RFC 2001::/23 IETF protocol assignments: g1 in 0x0000-0x01ff. Contains
+	// Teredo (2001::/32), the PCP anycast prefix (2001:1::/32) and the
+	// benchmarking prefix (2001:2::/48).
+	//
+	// The documentation prefix 2001:db8::/32 is NOT in it. 2001::/23 fixes only
+	// the top 23 bits, which constrains g1 to 0x0000-0x01ff, and 0x0db8 is above
+	// that range. It is listed on its own line below because a comment claiming
+	// otherwise is exactly what an earlier version of this function asserted.
+	if (g0 === 0x2001 && (g1 & 0xfe00) === 0) return true;
+	if (g0 === 0x2001 && g1 === 0x0db8) return true; // RFC 3849 documentation
+
+	// RFC 9637 3fff::/20 documentation prefix.
+	if (g0 === 0x3fff) return true;
+
+	// 6to4 (RFC 3056). Groups 1 and 2 are an IPv4 address in wire order, so
+	// 2002:a9fe:a9fe:: is 169.254.169.254 and 2002:7f00:1:: is 127.0.0.1.
+	// Blocking only the v4 spelling of those targets leaves this as a direct way
+	// past the whole guard, which is what it was before this check existed.
+	if (g0 === 0x2002 && isBlockedV4(g1 >> 8, g1 & 255, g2 >> 8, g2 & 255)) return true;
+
+	// ff00::/8 multicast. Compared on the top byte, not `g0 === 0xff`: ff02::1 is
+	// the all-nodes link-local group and ff0e::2 is SSDP, and an equality test on
+	// the whole first group matches neither.
+	if ((g0 & 0xff00) === 0xff00) return true;
+	if ((g0 & 0xffc0) === 0xfe80) return true;      // fe80::/10 link-local
+	if ((g0 & 0xffc0) === 0xfec0) return true;      // fec0::/10 site-local, deprecated
+	if ((g0 & 0xfe00) === 0xfc00) return true;      // fc00::/7 unique local
+	return false;
+}
+
 function isBlockedHost(hostname) {
 	const host = normalizeHost(hostname);
 	if (BLOCKED_HOSTS.includes(host)) return true;
 	if (host.endsWith(".localhost")) return true;
-	// Any address in a private, loopback, link-local or reserved range, in v4 or
-	// v6. Cheaper and far more complete than trying to enumerate every spelling.
+
 	const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-	if (v4) {
-		const [a, b] = v4.slice(1).map(Number);
-		if (
-			a === 0 || a === 10 || a === 127 ||
-			(a === 169 && b === 254) ||
-			(a === 172 && b >= 16 && b <= 31) ||
-			(a === 192 && b === 168) ||
-			// RFC 6598 shared address space (CGNAT). Carrier NAT equipment and
-			// some metadata endpoints live here, and it is not reachable from
-			// the public internet either.
-			(a === 100 && b >= 64 && b <= 127) ||
-			// RFC 6890 IETF protocol assignments, including 192.0.0.8/32
-			// (IPv4 dummy address) and the 192.0.2.0/24 test range.
-			(a === 192 && b === 0) ||
-			// RFC 2544 benchmarking range, 198.18.0.0/15.
-			(a === 198 && (b === 18 || b === 19)) ||
-			a >= 224
-		) {
-			return true;
-		}
-	}
-	if (/^f[cd][0-9a-f]{2}:/.test(host) || host === "::" || host === "::1") return true;
-	if (/^fe[89ab][0-9a-f]:/.test(host)) return true; // link-local
-	// NAT64 well-known prefix (RFC 6052) 64:ff9b::/96 and its 2001:db8:... variant.
-	// A blocked v4 target is reachable through these as an embedded address, so
-	// blocking only the v4 form would leave the guard incomplete.
-	if (/^64:ff9b:[0-9a-f]*:/.test(host) || host.startsWith("64:ff9b:")) return true;
+	if (v4) return isBlockedV4(...v4.slice(1).map(Number));
+	if (host.includes(":")) return isBlockedV6(host);
 	return false;
 }
 
@@ -321,9 +422,22 @@ function validateTarget(candidate, allowedHosts) {
 	if (hosts.length > 0) {
 		// Compare on the normalised form, and require a label boundary so that
 		// "example.com" does not authorise "evil-example.com".
+		//
+		// url.hostname never carries a port, so an allowlist entry that does
+		// (`origin.test:8443`) can never match anything and 403s every request,
+		// including the one the operator plainly meant to permit. An earlier
+		// version had that behaviour. The port is therefore stripped from the
+		// entry: this allowlist authorises HOSTS, and `ALLOWED_HOSTS` is parsed
+		// as a host list, so a port in an entry is a typo the operator expects to
+		// be tolerated rather than a rule that silently bans the world. Port
+		// restriction is not available on this path.
 		const host = normalizeHost(url.hostname);
 		const permitted = hosts.some((s) => {
-			const want = normalizeHost(s);
+			// Strip a port and any userinfo from the entry. The last colon is
+			// only a port separator for bracketed IPv6 or when it follows the
+			// last dot, which is why a naive split(":")[0] would mangle a bare
+			// IPv6 literal.
+			const want = normalizeHost(stripPort(s));
 			return host === want || host.endsWith("." + want);
 		});
 		if (!permitted) {
@@ -448,6 +562,24 @@ function cookieConsent(request) {
 }
 
 /**
+ * Whether the caller's `Cookie` header may go to `targetHost`.
+ *
+ * Consent is per request, and a request names one host. Following a redirect to a
+ * different host therefore needs fresh consent, because the caller consented to
+ * the origin they asked for, not to wherever that origin points. Without this the
+ * caller's session cookie rides a 302 to any host an origin chooses, which is
+ * exactly the leak the opt-in exists to bound.
+ *
+ * Compared on the normalised host, so a trailing dot or an IPv6 spelling does not
+ * count as a different host.
+ */
+function cookieConsentFor(request, targetHost, initialHost) {
+	if (!cookieConsent(request)) return false;
+	if (initialHost === null) return true;
+	return normalizeHost(targetHost) === normalizeHost(initialHost);
+}
+
+/**
  * Which engine this request asked for.
  *
  * The TLS transport is bound as `TLS_TRANSPORT` and must expose
@@ -490,10 +622,10 @@ const CLIENT_HINTS = [
 	"sec-ch-ua-wow64",
 ];
 
-function buildUpstreamHeaders(request, target) {
+function buildUpstreamHeaders(request, target, initialHost) {
 	const headers = new Headers();
 	const incoming = request.headers;
-	const forwardCookies = cookieConsent(request);
+	const forwardCookies = cookieConsentFor(request, target.hostname, initialHost);
 
 	const ua = incoming.get("user-agent") || "";
 	const persona = incoming.get("x-proxy-persona") || "edge";
@@ -501,7 +633,14 @@ function buildUpstreamHeaders(request, target) {
 	// A bot tool arriving with NO User-Agent at all scores an immediate bot
 	// verdict per Cloudflare's bot-score docs, so an empty one is treated as a
 	// bot tool here too rather than forwarded.
-	const overridesIdentity = chromePersona || persona === "edge" && looksLikeBotTool(ua);
+	//
+	// This must be true whenever the User-Agent is REPLACED, whichever branch
+	// replaces it. An earlier version wrote `persona === "edge" && ...`, which
+	// was false for `persona=chrome` arriving without engine=tls: that branch
+	// falls through to the edge UA while the caller's Client Hints were forwarded
+	// untouched, which is the incoherence this flag exists to prevent.
+	const overridesIdentity =
+		chromePersona || (persona !== "pass" && looksLikeBotTool(ua));
 
 	for (const [key, value] of incoming.entries()) {
 		const lower = key.toLowerCase();
@@ -590,23 +729,32 @@ const DROP_FROM_RESPONSE = new Set([
 // An upstream redirect points at the third-party origin. Handing that to the
 // client would let the client leave the proxy entirely, so rewrite it back into
 // proxy space.
-function rewriteLocation(location, proxyOrigin) {
+//
+// `base` is the URL the Location came from and is not optional: a Location may be
+// relative (`/next`) or protocol-relative (`//evil.test/x`), and `new URL(x)`
+// throws on the first and reads `evil.test` as the host on the second. An earlier
+// version had no base, so both shapes were returned verbatim, the client left the
+// proxy, and a 200 response carrying a relative Location took the client to the
+// proxy's own site. Resolving against the base first makes every shape absolute,
+// so what the client receives is always a full proxy-space URL.
+function rewriteLocation(location, proxyOrigin, base) {
+	let resolved;
 	try {
-		const u = new URL(location);
-		if (u.protocol !== "http:" && u.protocol !== "https:") return location;
-		return proxyOrigin + "/" + u.href;
+		resolved = base ? new URL(location, base) : new URL(location);
 	} catch {
 		return location;
 	}
+	if (resolved.protocol !== "http:" && resolved.protocol !== "https:") return location;
+	return proxyOrigin + "/" + resolved.href;
 }
 
-function buildResponseHeaders(upstream, proxyOrigin) {
+function buildResponseHeaders(upstream, proxyOrigin, base) {
 	const out = new Headers();
 	for (const [key, value] of upstream.entries()) {
 		const lower = key.toLowerCase();
 		if (DROP_FROM_RESPONSE.has(lower)) continue;
 		if (lower === "location") {
-			out.set(key, rewriteLocation(value, proxyOrigin));
+			out.set(key, rewriteLocation(value, proxyOrigin, base));
 			continue;
 		}
 		// Do not pass Cloudflare-injected response headers through to the client.
@@ -665,8 +813,17 @@ function applyCors(request, headers) {
 	headers.set("access-control-allow-origin", request.headers.get("origin") || "*");
 	// Append to any Vary the origin already sent rather than clobbering it: the
 	// origin's own cache keys matter as much as ours.
+	//
+	// `Vary: *` is not a list of header names. It is the one value that means "the
+	// response is uncacheable, do not key on anything", so appending `, Origin` to
+	// it produces `*, Origin`, which RFC 9110 s5.2.2 does not define and caches
+	// cannot parse. `*` also means we should not be adding a cache key at all.
 	const existing = headers.get("vary");
-	headers.set("vary", existing ? `${existing}, Origin` : "Origin");
+	if (existing === "*") {
+		headers.set("vary", "*");
+	} else {
+		headers.set("vary", existing ? `${existing}, Origin` : "Origin");
+	}
 	for (const [k, v] of Object.entries(CORS_STATIC)) headers.set(k, v);
 }
 
@@ -700,6 +857,11 @@ export default {
 		if (!isAuthorized(request, authToken)) {
 			const h = new Headers();
 			applyCors(request, h);
+			// RFC 9110 s15.5.2 makes WWW-Authenticate REQUIRED on a 401, and this
+			// proxy accepts two schemes. Without it a client that wants to
+			// discover which one to send has nothing to read, and a browser
+			// caller gets a bare 401 with no challenge at all.
+			h.set("www-authenticate", 'Bearer realm="proxy", charset="UTF-8"');
 			return jsonError(401, "Unauthorized", h);
 		}
 
@@ -727,6 +889,16 @@ export default {
 						env && env.TLS_TRANSPORT && env.TLS_TRANSPORT.fetch
 					),
 					default_user_agent: EDGE_UA,
+					// The timeout bounds headers only. The body is not bounded, and
+					// reporting it otherwise would make the number a claim the code
+					// does not keep.
+					timeout_scope: "time-to-headers; the response body is not bounded",
+					cookie_consent_scope:
+						"the host the caller named; not carried across a redirect",
+					allowed_hosts_match: "hostnames only; a port in an entry is ignored",
+					tls_transport_supports_body: !!(
+						env && env.TLS_TRANSPORT && env.TLS_TRANSPORT.supportsBody === true
+					),
 					personas: ["edge", "chrome (requires engine=tls)", "pass"],
 				}, null, 2),
 				{ status: 200, headers: h },
@@ -759,6 +931,24 @@ export default {
 				h,
 			);
 		}
+		// A body cannot be sent over a transport that has not said it can send one.
+		// Refusing here is the difference between an error the caller can act on and
+		// a 200 from an origin that received an empty POST.
+		if (transport && hasBody && transport.supportsBody !== true) {
+			const h = new Headers();
+			applyCors(request, h);
+			return jsonError(
+				501,
+				"engine=tls cannot send a request body: TLS_TRANSPORT must expose " +
+					"supportsBody = true to receive method and body. " +
+					"Use engine=fetch for bodied requests.",
+				h,
+			);
+		}
+
+		// The host the caller named. Cookie consent is scoped to it: a redirect to
+		// a different host does not inherit it.
+		const initialHost = target.hostname;
 
 		// Follow redirects by hand so each hop gets freshly built headers, the
 		// allowlist and SSRF blocklist apply to EVERY hop, and the final Location
@@ -805,7 +995,7 @@ export default {
 			try {
 				const init = {
 					method: hopMethod,
-					headers: buildUpstreamHeaders(request, current),
+					headers: buildUpstreamHeaders(request, current, initialHost),
 					body: hopBody,
 					signal: controller.signal,
 				};
@@ -818,8 +1008,18 @@ export default {
 					// /__config reports it as resolved. A transport that cannot honour
 					// a signal must document that, not inherit a deadline that is not
 					// enforced.
+					//
+					// The method and body are passed too, but ONLY for a transport that
+					// declares it can send them. An earlier version passed neither, so
+					// every POST on engine=tls arrived at the origin bodiless and the
+					// origin's 200 came back as success: a write that was reported as
+					// done and had not happened. `supportsBody` makes the transport say
+					// so out loud; a transport without it is refused above rather than
+					// quietly dropping the payload.
 					response = await transport.fetch(current.href, {
+						method: hopMethod,
 						headers: init.headers,
+						body: hopBody,
 						signal: init.signal,
 					});
 				} else {
@@ -841,11 +1041,29 @@ export default {
 					h,
 				);
 			}
+			// The timer is cleared once the response HEADERS have arrived, so
+			// X-Proxy-Timeout-Ms bounds time-to-headers and nothing else. It does
+			// NOT bound the body: an origin that sends headers in 10 ms and then
+			// stalls for the full timeout still completes here. That is a
+			// deliberate choice, because aborting mid-stream truncates a response
+			// that has already started and there is no way to signal truncation to
+			// the client through a streaming body. The value is documented as
+			// time-to-headers for this reason and must stay documented as such.
 			clearTimeout(timer);
 
 			const status = response.status;
 			const location = response.headers.get("location");
-			if (status >= 300 && status < 400 && location) {
+			// Only the five statuses that actually redirect. `status >= 300 &&
+			// status < 400` also matched 304, whose Location is not a redirect at
+			// all: RFC 9110 s15.4.5 gives it to identify the selected
+			// representation for a conditional request, and a 304 carries no body
+			// and cannot be fetched. Consuming one here discarded the client's
+			// conditional headers and replaced the 304 with a bodyless 200, so the
+			// client cached a response it never received.
+			const redirects =
+				status === 301 || status === 302 || status === 303 ||
+				status === 307 || status === 308;
+			if (redirects && location) {
 				if (hop === MAX_REDIRECTS) {
 					const h = new Headers();
 					applyCors(request, h);
@@ -878,7 +1096,11 @@ export default {
 			break;
 		}
 
-		const outHeaders = buildResponseHeaders(response.headers, new URL(request.url).origin);
+		const outHeaders = buildResponseHeaders(
+			response.headers,
+			new URL(request.url).origin,
+			current.href,
+		);
 		applyCors(request, outHeaders);
 
 		// Statuses that must not carry a body (RFC 9110 s15.4).
