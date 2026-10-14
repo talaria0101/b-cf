@@ -8,8 +8,9 @@ compatibility_date = "2026-03-24"
 # workers.dev gives the deploy a reachable trigger. An earlier revision set this
 # to false and declared no routes, which made `wrangler deploy` SUCCEED while
 # publishing nothing at all: wrangler's triggersDeploy sees an empty route list
-# and its subdomainDeploy posts {"enabled": false}. The output was a worker you
-# could not call. Set this true, or replace it with a [[routes]] entry below.
+# and its subdomainDeploy posts {"enabled": false}. The output was a deployed
+# script with no reachable trigger. Set this true, or replace it with a [[routes]]
+# entry below.
 workers_dev = true
 
 # To serve a custom domain instead, set workers_dev = false and uncomment:
@@ -20,7 +21,7 @@ workers_dev = true
 # Workers Logs is a THIRD billed meter (20M events included, +$0.60/M) and
 # observability is ON BY DEFAULT for new Workers. At 100M requests/month that is
 # up to +$48.00 on top of the request and CPU meters, for logs this proxy never
-# reads. Turn it off unless you want them. See RESEARCH.md 7.1.
+# reads. Turn it off unless they are wanted. See RESEARCH.md 7.1.
 [observability]
 enabled = false
 

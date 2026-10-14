@@ -91,7 +91,7 @@ function requestTimeoutMs(request) {
 //
 // CHROME_MAJOR is pinned and WILL GO STALE. As of 2026-10-13 Chrome stable is
 // 155 (ChromiumDash, and the b-ids measured corpus agrees), so 140 below is
-// already ~15 releases behind. Bump CHROME_MAJOR when you deploy; nothing else
+// already ~15 releases behind. Bump CHROME_MAJOR at deploy time; nothing else
 // needs to change, because the UA and both hint headers are built from it.
 //
 // This is a fixed string, not a rotating one, and that is deliberate. v1's
@@ -136,7 +136,7 @@ const CHROME_MAJOR = 140;
  * browser's is a *louder* signal than an honest one, because the mismatch is the
  * tell. Claiming Chrome over `fetch()` inherits exactly that defect; v2 does not.
  *
- * If you want the Chrome claim, the transport has to be built to match. See
+ * For the Chrome claim to mean anything, the transport has to match it. See
  * `engine=tls` in README.md and the Layer 1 section of RESEARCH.md.
  */
 const CHROME_UA =
@@ -510,14 +510,14 @@ const EDGE_IDENTITY = new Set([
 	"sec-fetch-mode",
 	"sec-fetch-dest",
 	"sec-fetch-user",
-	// The engine and persona are ours, not the caller's. A caller must not be
+	// The engine and persona belong to the proxy, not the caller. A caller must not be
 	// able to name an engine that this deployment has no transport bound for.
 	"x-proxy-engine",
 	"x-proxy-persona",
 ]);
 
 // Client Hints are NOT listed in EDGE_IDENTITY, because they are not always
-// ours to drop: see CLIENT_HINTS in buildUpstreamHeaders, which strips them
+// the proxy's to drop: see CLIENT_HINTS in buildUpstreamHeaders, which strips them
 // only when the proxy is replacing the User-Agent and would otherwise leave the
 // caller's hints contradicting it.
 
@@ -812,12 +812,12 @@ function applyCors(request, headers) {
 	// opt-in below, which is the supported path.
 	headers.set("access-control-allow-origin", request.headers.get("origin") || "*");
 	// Append to any Vary the origin already sent rather than clobbering it: the
-	// origin's own cache keys matter as much as ours.
+	// origin's own cache keys matter as much as the proxy's.
 	//
 	// `Vary: *` is not a list of header names. It is the one value that means "the
 	// response is uncacheable, do not key on anything", so appending `, Origin` to
 	// it produces `*, Origin`, which RFC 9110 s5.2.2 does not define and caches
-	// cannot parse. `*` also means we should not be adding a cache key at all.
+	// cannot parse. `*` also means no cache key should be added at all.
 	const existing = headers.get("vary");
 	if (existing === "*") {
 		headers.set("vary", "*");
@@ -914,8 +914,8 @@ export default {
 		const method = request.method.toUpperCase();
 		const hasBody = method !== "GET" && method !== "HEAD";
 
-		// Engine selection. `tls` needs a bound userland transport; without one we
-		// refuse rather than silently serving a fetch(), because a caller that
+		// Engine selection. `tls` needs a bound userland transport; without one the
+		// request is refused rather than silently served a fetch(), because a caller that
 		// asked for a Chrome-shaped handshake and got the runtime's own is worse
 		// off than one told no.
 		const engine = requestedEngine(request);

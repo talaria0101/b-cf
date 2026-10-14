@@ -148,9 +148,9 @@ main use.
 The consequence is real and is not a reason to change the behaviour, but it is the
 thing a caller has to know:
 
-> **This proxy will hand a cookie to any host you name.** If you call it with a
-> `Cookie` header set for a private application, the destination receives that
-> cookie. Only send cookies to destinations you already trust with them.
+> **This proxy will hand a cookie to any host the request names.** A `Cookie`
+> header set for a private application arrives at the destination. Send cookies
+> only to destinations that already hold them.
 
 v2 keeps the capability and changes the default: cookies are **not** forwarded
 unless the caller opts in per request with `X-Proxy-Forward-Cookies: 1`, and
@@ -267,7 +267,7 @@ the write as nonsense or answer with a record it encrypted itself.
 
 | transport | who writes the ClientHello | the fingerprint is |
 |---|---|---|
-| `fetch()` | workerd | fixed, not a browser, and not ours |
+| `fetch()` | workerd | fixed, not a browser, and not ours to control |
 | `node:net` / `node:tls` | workerd, on top of `connect()` | not ours |
 | `connect()` then `startTls()` | workerd, and it fails closed for tunnels | not ours |
 | `connect({secureTransport:"off"})` + userland TLS | **us** | whatever we encode |
@@ -401,8 +401,9 @@ layer **"is not included here"**, and the oss branch "runs in stateless mode out
 the box, with optional MinIO/S3-compatible bucket caching". The GCP Cloud Run +
 MongoDB Atlas + GCS stack appears in `architecture.md`, where that same file marks
 the SaaS configuration as "not part of the open source branch". So the cost of
-self-hosting is a service or two you operate, and the honest comparison is v2's
-$5/month against a container bill plus whatever datastore you attach. An earlier
+self-hosting is a service or two under the operator's own control, and the honest
+comparison is v2's $5/month against a container bill plus whatever datastore is
+attached. An earlier
 draft of this document attributed that stack to the README and inverted it.
 
 ### 4.2 browser-use
@@ -726,7 +727,7 @@ deploy config, and it is now there:
 enabled = false
 ```
 
-Set that unless you want Workers Logs, and the meter disappears.
+Set that unless Workers Logs are wanted, and the meter disappears.
 
 **That meter has an expiry date the table above does not carry.** The same pricing
 page states:
@@ -844,7 +845,7 @@ solving. That is a property of the network and of a browser, not of code.
 
 ### 7.4 What adds real money
 
-If you need JS execution, the marginal cost is Browser Run and nothing else.
+Where JS execution is needed, the marginal cost is Browser Run and nothing else.
 $0.09/hour = **$0.000025 per second of browser time**:
 
 | Seconds of browser time per page | Cost per page | 1M pages/month |
@@ -1010,7 +1011,7 @@ been**, or **survived that should not have**. There are no decorative entries.
 7. **`secure-context upgrade header`** caught a defect that had just been
    written: see section 6.4.
 
-A surviving mutation is not a nuisance. It is the assertion telling you it was not
+A surviving mutation is not a nuisance. It is the assertion reporting that it was not
 pinning what it claimed.
 
 ### 8.6 Two clocks, and the second one was misreported for a while
