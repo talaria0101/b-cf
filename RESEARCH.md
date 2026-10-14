@@ -1137,6 +1137,30 @@ wrangler deploy
 command above genuinely takes effect. With no token set, the proxy is open, which
 is v1's posture and not something to deploy.
 
+**The bundle is the artifact, so test the bundle.** What deploys is not
+`rig/v2.js`: wrangler runs it through esbuild, and the bundle is what runs in
+production. The suite therefore accepts any worker path, so the built output can
+be checked the same way:
+
+```bash
+wrangler deploy --dry-run --outdir /tmp/bundle
+python3 harness/test_proxy.py /tmp/bundle/v2.js
+```
+
+Measured on wrangler 4.150.0: the build succeeds (21.15 KiB, 6.73 KiB gzipped)
+and the bundle passes all 313 assertion rows and all 14 controls. This check found
+a harness defect: the one control that patches the worker's own source to confirm
+an assertion pins something was anchored to tab indentation, and esbuild emits
+two spaces, so the control reported a false failure against a correct bundle. The
+patch is now indentation-tolerant.
+
+**`workers_dev` is set explicitly, and why that matters.** wrangler's
+`getSubdomainValues` defaults `workers_dev` to `routes.length === 0`, and
+`subdomainDeploy` posts that value to `/subdomain`. An earlier revision of this
+config set `workers_dev = false` with no `routes`, which publishes a script with
+no reachable trigger: `deploy` reports success, and the worker cannot be called.
+`workers_dev = true` is stated here rather than left to the default.
+
 `ALLOWED_HOSTS` is an optional `vars` entry, comma-separated:
 
 ```toml

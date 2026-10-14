@@ -1198,9 +1198,17 @@ def probe_header_coverage():
         # only defence was workerd's parser would also show nothing forwarded, so
         # this pins that the PROXY's own list is what drops it: without the entry
         # the value reaches the origin.
+        #
+        # The patch is indentation-tolerant on purpose. test_proxy.py also runs
+        # against a BUILT worker, not just the source: wrangler bundles
+        # rig/v2.js with esbuild, and the artifact that actually deploys is the
+        # bundle, not the file in the repo. esbuild reindents to two spaces and
+        # renames the module wrapper, so a tab-anchored pattern does not match
+        # there and this control reports a false failure. Found by running the
+        # suite against `wrangler deploy --dry-run --outdir` output.
         with open(V2) as fh:
             src = fh.read()
-        mutant = src.replace('\t"transfer-encoding",\n', "", 1)
+        mutant = re.sub(r'^[ \t]*"transfer-encoding",\n', "", src, count=1, flags=re.M)
         if mutant != src:
             d = tempfile.mkdtemp(prefix="v2-temut-")
             p2 = os.path.join(d, "worker.js")

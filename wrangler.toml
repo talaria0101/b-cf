@@ -33,13 +33,12 @@ enabled = false
 # ALLOWED_HOSTS = "example.com,githubusercontent.com"
 
 # engine=tls is refused with a 501 unless something is bound as TLS_TRANSPORT.
-# The binding must expose fetch(url, { headers, signal }) -> Response. A service
-# binding (a Fetcher) already satisfies that shape, so an adopted userland TLS
-# transport can be wired up with, for example:
-#
-# [[services]]
-# binding = "TLS_TRANSPORT"
-# service = "my-tls-transport-worker"
+# The binding must expose
+#   fetch(url, { method, headers, body, signal }) -> Response
+#   supportsBody = true                 (only needed to send a request body)
+# A service binding (a Fetcher) satisfies the fetch() shape. It does NOT declare
+# supportsBody, so a POST on engine=tls gets a 501 until the bound transport
+# exposes that property too. See RESEARCH.md 3.3.
 #
 # It is deliberately not bound here: shipping an unaudited TLS stack behind a
 # unmeasured claim would be worse than the honest default. See RESEARCH.md 3.3.
