@@ -42,4 +42,4 @@ enabled = false
 # service = "my-tls-transport-worker"
 #
 # It is deliberately not bound here: shipping an unaudited TLS stack behind a
-# stealth claim would be worse than the honest default. See RESEARCH.md 3.3.
+# unmeasured claim would be worse than the honest default. See RESEARCH.md 3.3.

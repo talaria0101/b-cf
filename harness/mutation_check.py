@@ -204,7 +204,7 @@ MUTATIONS = [
         'return host === want || host.endsWith(want);',
         "the label boundary that stops evil-example.com matching example.com",
     ),
-    # --- round 2: ten defects the adversarial reviews found, one invariant each ---
+    # --- round 2: ten defects the review rounds found, one invariant each ---
     # Each of these survived the suite before its assertion existed. They are here
     # so the next person does not have to rediscover that a passing suite says
     # nothing about an invariant nothing asserts.

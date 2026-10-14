@@ -1,19 +1,20 @@
 # api.rv v2
 
-A Cloudflare Workers reverse proxy, plus the research behind it and a harness that
-runs the code under Cloudflare's real runtime.
+A Cloudflare Workers reverse proxy. Plain ES2022, no build step, no dependencies.
+Alongside it: the measurements behind each design decision, and a harness that
+runs the worker under Cloudflare's own `workerd` runtime.
 
 Full write-up, evidence, and pricing: **[RESEARCH.md](RESEARCH.md)**.
 
 ## Quick start
 
 ```bash
-wrangler secret put AUTH_TOKEN     # v1 shipped unauthenticated; do not repeat that
+wrangler secret put AUTH_TOKEN     # the binding v2 reads; without it the proxy is open
 wrangler deploy
 ```
 
-`wrangler.toml` is shipped and pins `main = "rig/v2.js"` and the compatibility date
-the proofs were run against. `AUTH_TOKEN` is read from the binding, so the secret
+`wrangler.toml` pins `main = "rig/v2.js"` and the compatibility date the
+measurements ran against. `AUTH_TOKEN` is read from the binding, so the secret
 command takes effect.
 
 Optional allowlist, in `wrangler.toml`:
@@ -23,6 +24,9 @@ Optional allowlist, in `wrangler.toml`:
 ALLOWED_HOSTS = "example.com,githubusercontent.com"
 ```
 
+Comma-separated, whitespace tolerated. The parsed list is reported at
+`GET /__config`.
+
 Three request forms, all supported:
 
 ```
@@ -31,32 +35,39 @@ Three request forms, all supported:
 /?url=https%3A%2F%2Fexample.com%2Fpath
 ```
 
-`GET /__config` reports the resolved timeout, effective allowlist, whether auth is
-required, and whether a `TLS_TRANSPORT` binding is present.
+`GET /__config` reports the resolved timeout, the effective allowlist, whether
+auth is required, and whether a `TLS_TRANSPORT` binding is present.
 
-## Identity: three personas, and the default is honest
+## Request identity
 
-| `X-Proxy-Persona` | the origin sees | applies when |
+Three values of `X-Proxy-Persona`:
+
+| value | what the destination sees | applies when |
 |---|---|---|
-| `edge` (**default**) | `User-Agent: Cloudflare-Workers`, no Client Hints | always |
+| `edge` (default) | `User-Agent: Cloudflare-Workers`, no Client Hints | always |
 | `chrome` | Chrome UA + low-entropy hints + `Upgrade-Insecure-Requests` | `X-Proxy-Engine: tls` **and** a bound transport |
-| `pass` | your UA, verbatim | opt-in |
+| `pass` | the caller's UA, verbatim | opt-in |
 
-The default is `edge` because v1's habit was backwards. It announced Safari 18.5
-over a handshake that `tls.peet.ws` reports as `t13d1312h2_a44d0ee8b3cc_e381dae6da6b`,
-and a real Chrome 155 is `t13i1516h2_8daaf6152771_...`: both TLS 1.3, but 13
-ciphers against Chrome's 15 and 12 extensions against 16. A browser User-Agent on
-a handshake that is not that browser's is a louder signal than an honest one,
-because the mismatch is the tell. So the default describes the transport, and
-`chrome` is opt-in and gated on a transport that can back the claim.
+The default is `edge` because v1 did the opposite. v1 announced Safari 18.5 on
+every request, over a handshake that `tls.peet.ws` reports as
+`t13d1312h2_a44d0ee8b3cc_e381dae6da6b`. A real Chrome 155 is
+`t13i1516h2_8daaf6152771_...`: both TLS 1.3, but 13 ciphers against Chrome's 15
+and 12 extensions against 16. A browser User-Agent on a handshake that is not
+that browser's is a weaker signal than an accurate one, because the mismatch is
+the inconsistency. So the default states the transport, and `chrome` is opt-in,
+gated on a transport that can back the claim.
+
+When the proxy replaces a User-Agent it also drops the caller's Client Hints,
+since a caller's `sec-ch-ua-platform` beside this proxy's UA is the same kind of
+mismatch. A caller whose own UA is forwarded untouched keeps its hints.
 
 `X-Proxy-Engine: tls` selects a userland TLS transport bound as `TLS_TRANSPORT`,
-which must expose `fetch(url, { headers }) -> Response`. Without that binding the
-request gets a **501** naming the missing binding, not a silent downgrade to the
-`fetch()` path it was meant to avoid. `TLS_TRANSPORT` is not implemented here; see
-`RESEARCH.md` section 3.3 and Limits item 4.
+which must expose `fetch(url, { headers, signal }) -> Response`. Without that
+binding the request gets a **501** naming the missing binding, rather than
+quietly using the `fetch()` path the caller was avoiding. `TLS_TRANSPORT` is not
+implemented here; see `RESEARCH.md` section 3.3 and Limits item 4.
 
-Both headers are stripped before the request reaches the origin.
+Both headers are stripped before the request reaches the destination.
 
 ## Run the proofs
 
@@ -66,45 +77,43 @@ python3 harness/mutation_check.py        # 40 mutations, all must be caught, ~8s
 python3 harness/probe_raw_socket.py      # the TLS-raw-stream measurement, ~0.3s
 ```
 
-All three exit non-zero on failure. `harness/test_proxy.py` accepts a worker path
-as `argv[1]`, which is how the mutation check runs variants without ever writing
-to `rig/v2.js`.
+All three exit non-zero on failure. `test_proxy.py` accepts a worker path as
+`argv[1]`, which is how the mutation check runs variants without ever writing to
+`rig/v2.js`.
 
-`harness/probe_raw_socket.py` is what corrected the document's claim that TLS
-fingerprint control was impossible on Workers. It runs the same worker twice, once
-under workerd's default network policy and once under a permissive one, so the
-positive result is backed by a control that actually fails.
+`probe_raw_socket.py` runs one worker twice, under workerd's default network
+policy and under a permissive one, so the positive result is backed by a control
+that actually fails.
 
 The four timeout probes (`probe_timeout.py`, `probe_slow_upstream.py`,
 `probe_abort_discrimination.py`, `probe_timer_semantics.py`) are the measurements
-behind section 8.6 of the research document. They are standalone and each states
-the candidates it is separating.
+behind section 8.6. Each is standalone and states what it separates.
 
-## What this is not
+## Scope
 
-It does not defeat Turnstile, reCAPTCHA, or Cloudflare's JS challenges, and it
-cannot. Those require a real browser and a solved token. `RESEARCH.md` section 3
-has the evidence, and section 6.3 lists the limits that are written into the
-worker as comments.
+This does not solve Turnstile, reCAPTCHA, or Cloudflare's JavaScript challenges,
+and cannot. Those tokens are issued inside a browser. `RESEARCH.md` section 3
+has the evidence; section 6.3 lists the limits written into the worker as
+comments.
 
-It also does not change the egress IP, which is the layer that decides most
-bot-managed sites. `RESEARCH.md` section 3.3 is about the layer above that one.
+It also does not change the egress address, which is the layer that decides most
+bot-managed sites. Section 3.3 concerns the layer above that one.
 
-`RESEARCH.md` section 6.2 lists the behaviour changes that will break an existing
-v1 caller (cookies and `Authorization` are no longer forwarded by default).
+Section 6.2 lists the behaviour changes that will affect an existing v1 caller,
+including that cookies and `Authorization` are not forwarded by default.
 
 ## Layout
 
 ```
 rig/v2.js             the worker: plain ES2022, no build step, no dependencies
-rig/v1-baseline.js    v1 + a 2-line provenance header, as the negative control
+rig/v1-baseline.js    v1, reformatted, with a 3-line provenance header (RESEARCH.md 1)
 wrangler.toml         deploy config; pins the tested compatibility date
 LICENSE               0BSD
 harness/rig.py        runs a worker under real workerd with an in-process TAP origin
 harness/test_proxy.py the suite
 harness/mutation_check.py
 harness/probe_*.py    five standalone probes
-tools/ja4.py          JA4 from a raw ClientHello, from the spec
+tools/ja4.py          JA4 from a raw ClientHello, computed from the specification
 proofs/               captured output cited by RESEARCH.md
 evidence/             upstream artefacts used as inputs, mirrored verbatim
 bin/wd                workerd 2026-10-13, Cloudflare's actual runtime
@@ -113,11 +122,11 @@ bin/wd                workerd 2026-10-13, Cloudflare's actual runtime
 ## Requirements
 
 `bin/wd` must be present: the harness drives `workerd` directly over an AF_UNIX
-socket, using only its own CAPNP config. **`harness/node_modules/` is NOT required**
-to run the proofs (verified by removing it). Neither is any Python package: the
-harness is pure standard library.
+socket using only its own CAPNP config. Nothing else is needed. The harness is
+pure Python standard library, with no third-party packages and no `node_modules`
+directory.
 
-To rebuild `bin/wd` and `bin/node` from scratch:
+To rebuild `bin/wd`:
 
 ```bash
 mkdir -p bin
@@ -125,11 +134,6 @@ curl -sL -o /tmp/wd.gz \
   https://github.com/cloudflare/workerd/releases/download/v1.20261013.1/workerd-linux-64.gz
 # gunzip writes `wd` and REMOVES wd.gz, so there is nothing left to move.
 gunzip -f /tmp/wd.gz && mv /tmp/wd bin/wd && chmod +x bin/wd
-
-curl -sL https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz \
-  | tar xJ --no-same-owner -C bin
-mv bin/node-v24.21.0-linux-x64 bin/node
-
-# `npm` is a shim that runs `#!/usr/bin/env node`, so node must be on PATH.
-cd harness && PATH="$PWD/../bin/node/bin:$PATH" ../bin/node/bin/npm install --no-audit --no-fund
 ```
+
+`tools/ja4.py` needs no network and no dependencies.

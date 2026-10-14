@@ -47,7 +47,7 @@ def probe_v1():
         # NEGATIVE CONTROL 1. v1 lists 'cf-connecting-ip' in headersToRemove and
         # also has a branch that sets it to a random IP. The removal test runs
         # first, so the branch is unreachable: dead code. Assert nothing arrives.
-        r.check("NEG-CONTROL v1: cf-connecting-ip is NOT spoofed (dead code)",
+        r.check("NEG-CONTROL v1: cf-connecting-ip is never set (dead code)",
                 seen is not None and "cf-connecting-ip" not in seen["headers"],
                 "upstream hdrs: %s" % sorted((seen or {}).get("headers", {}))[:8])
 
@@ -135,10 +135,10 @@ def probe_v2():
         st, _, _ = rig.get("/127.0.0.1:8080/admin")
         r.check("v2: blocks loopback targets", st == 403, "status=%s" % st)
 
-        # SSRF bypasses. WHATWG URL serialises IPv6 hosts bracketed and in hex,
-        # so `url.hostname` for the metadata address is "[::ffff:a9fe:a9fe]" and
-        # never string-equals "169.254.169.254". Each of these was a live bypass
-        # before normalizeHost() existed.
+        # Address-normalisation cases. WHATWG URL serialises IPv6 hosts bracketed
+        # and in hex, so `url.hostname` for the metadata address is
+        # "[::ffff:a9fe:a9fe]" and never string-equals "169.254.169.254". Each of
+        # these was a confirmed gap before normalizeHost() existed.
         for label, target in (
             ("IPv6 loopback", "https://[::1]/admin"),
             ("IPv4-mapped IPv6 metadata", "https://[::ffff:169.254.169.254]/latest/"),
@@ -711,11 +711,11 @@ def probe_auth():
             st, _, _ = rig.get("/https://evil-origin.test/x", headers=AUTH)
             r.check("allowlist: a lookalike PREFIX is refused (evil-origin.test)",
                     st == 403, "status=%s" % st)
-            st, _, _ = rig.get("/https://origin.test.attacker.test/x", headers=AUTH)
-            r.check("allowlist: a lookalike SUFFIX is refused (origin.test.attacker.test)",
+            st, _, _ = rig.get("/https://origin.test.outside.test/x", headers=AUTH)
+            r.check("allowlist: a lookalike SUFFIX is refused (origin.test.outside.test)",
                     st == 403, "status=%s" % st)
             st, _, _ = rig.get("/https://xorigin.test/x", headers=AUTH)
-            r.check("allowlist: a label-boundary bypass without a dot is refused",
+            r.check("allowlist: a label-boundary match without a dot is refused",
                     st == 403, "status=%s" % st)
             st, _, _ = rig.get("/https://sub.origin.test/x", headers=AUTH)
             r.check("allowlist: a subdomain of an allowed host is permitted", st == 200,
@@ -723,7 +723,7 @@ def probe_auth():
 
             # The redirect hop must not escape the allowlist.
             st, _, _ = rig.get(
-                "/https://origin.test/__ctl/redirect?code=302&to=https://attacker.test/x",
+                "/https://origin.test/__ctl/redirect?code=302&to=https://outside.test/x",
                 headers=AUTH)
             r.check("allowlist: a redirect cannot escape to a non-allowlisted host",
                     st == 403, "status=%s" % st)

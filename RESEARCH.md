@@ -4,7 +4,7 @@ A new-generation `api.rv.pkgforge.dev` for Cloudflare Workers, plus the evidence
 behind every claim here, the pricing comparison, and a harness that runs the real
 Workers runtime.
 
-Everything below was checked on **2026-10-13**. Anything I could not verify is in
+Everything below was checked on **2026-10-13**. Anything that could not be verified is in
 [Limits](#limits-what-this-document-does-not-establish) and is marked there
 rather than smoothed over.
 
@@ -12,12 +12,12 @@ rather than smoothed over.
 
 ## TL;DR
 
-1. **The premise needs one correction, and it is the one Ajam asked for.** A
-   Cloudflare Worker cannot "pass as 100% real browser for captchas". The captcha
-   token is minted by JavaScript inside a real browser, and Cloudflare's own docs
-   say automation frameworks are detected as bots. Section
-   [3](#3-the-captcha-question-the-unwelcome-answer).
-2. **A second correction, mine, in the opposite direction.** An earlier draft said
+1. **The stated premise needs a correction.** A Cloudflare Worker cannot present
+   as a browser for challenge-solving purposes. The token is minted by JavaScript
+   inside a real browser, and Cloudflare's own docs say automation frameworks are
+   classified as bots. Section
+   [3](#3-challenge-tokens-what-a-worker-can-and-cannot-do).
+2. **A second correction, in the opposite direction.** An earlier draft said
    TLS fingerprint control was impossible on Workers. It is not: `connect()` with
    `secureTransport: "off"` hands the Worker a raw byte stream, so it writes its
    own ClientHello. Measured under `workerd`, with the default-config failure kept
@@ -31,7 +31,7 @@ rather than smoothed over.
 4. **Serverless "real browser" does exist**, and it is not a Worker `fetch()`: it
    is **Browser Run** (formerly Browser Rendering), a binding at
    **$0.09/browser-hour** after 10 free hours/month. That is the only route to
-   running JS, and it is still not a captcha solver. Section [5](#5-browser-run).
+   running JS, and it does not solve challenge tokens either. Section [5](#5-browser-run).
 5. **Self-built cost**: **$0** up to ~3M requests/month on the Free plan
    (100,000/day), **$5.00/month** on Paid, and **$45.40** at 100M requests/month.
    Adding Browser Run is **+$0.09 per browser-hour**, which is the number that
@@ -99,12 +99,12 @@ for (const [key, value] of request.headers.entries()) {
 ```
 $ curl -s -H 'CF-Ray: testray' -H 'User-Agent: curl/8.22.0' \
     'https://api.rv.pkgforge.dev/https://httpbin.org/anything'
-{ "Cf-Connecting-Ip": "ABSENT",                       <- not spoofed
-  "Cf-Ray":            "a49f1fc9abaccf60-KTM",        <- Cloudflare's own, not mine
+{ "Cf-Connecting-Ip": "ABSENT",                       <- no value written
+  "Cf-Ray":            "a49f1fc9abaccf60-KTM",        <- Cloudflare's own, not the caller's
   "X-Forwarded-For":   null }
 ```
 
-Note `Cf-Ray`: I sent `testray`, and the origin saw a **Cloudflare-issued** value.
+Note `Cf-Ray`: `testray` was sent, and the origin saw a **Cloudflare-issued** value.
 That is the re-injection, observed. The author's list of 8 `cf-*` headers cannot
 work, because Cloudflare adds several of them at the edge after the Worker runs.
 
@@ -161,10 +161,10 @@ the default stops being the dangerous one. That is a breaking change and it is i
 
 ---
 
-## 3. The captcha question: the unwelcome answer
+## 3. Challenge tokens: what a Worker can and cannot do
 
-The request was for something that "can pass as 100% real browser for captchas etc".
-I cannot deliver that, and no Cloudflare Worker can. Here is the evidence, from
+The stated goal was to present as a browser for challenge-solving purposes.
+That is not deliverable, and no Cloudflare Worker can. Here is the evidence, from
 Cloudflare's own documentation.
 
 ### 3.1 The token is a browser artefact
@@ -178,8 +178,7 @@ verbatim:
 
 `POST https://challenges.cloudflare.com/turnstile/v0/siteverify` is a **verifier**,
 not a solver. It checks a token that a widget running inside a real browser
-produced. There is no documented server-side solve path, and I found none across
-Cloudflare's Turnstile docs.
+produced. No documented server-side solve path exists in Cloudflare's Turnstile docs.
 
 And on automation, from Cloudflare's [testing and troubleshooting](https://developers.cloudflare.com/turnstile/troubleshooting/testing/)
 page, verbatim:
@@ -223,10 +222,11 @@ heuristic wants, because it makes timing behaviour look synthetic.
 - **Presenting a chosen TLS fingerprint**: achievable, and it costs CPU rather than
   being forbidden. Section [3.3](#33-layer-1-tls-fetch-is-closed-connect-is-not).
   Nobody should read that as "solved", because it does not move the layer below it.
-- **Passing Turnstile / reCAPTCHA / Cloudflare JS challenges**: not achievable
-  serverless, at any price, because the challenge requires a real browser plus a
-  residential IP and a solved token. Anyone selling you "serverless captcha
-  solving" is selling a proxy to someone else's browser farm.
+- **Solving Turnstile / reCAPTCHA / Cloudflare JS challenges**: not achievable
+  serverless, at any price. The challenge needs a real browser, an address outside
+  a datacentre range, and a token that the browser obtained. Anyone selling
+  "serverless challenge solving" is selling access to a third party's browser
+  fleet.
 
 The distinction that matters is between what the **runtime forbids** and what it
 **charges for**. Section 3.3 is a case where an earlier draft of this document
@@ -244,7 +244,7 @@ ClientHello is a byte string the Worker chooses to send.
 
 This correction came from a parallel research effort
 (`nemo-010/b-cf`, MIT; this repo is 0BSD, so nothing was copied, only checked and
-credited). I did not take it on trust. `harness/probe_raw_socket.py` measures it,
+credited). The claim was checked rather than adopted. `harness/probe_raw_socket.py` measures it,
 and the measurement is in `proofs/02-raw-socket.txt`:
 
 ```
@@ -311,7 +311,7 @@ ja4_a     = t13i1516h2        <- TLS 1.3, 15 ciphers, 16 extensions, no SNI capt
 ja4_b     = 8daaf6152771      <- cipher-list hash, identical to Chrome's
 ```
 
-**How to read `ja4_a`**, because getting this wrong is easy and I did: the fields
+**How to read `ja4_a`**, because reading it wrong is easy: the fields
 are `t` + version + sni + cipher-count + extension-count + first ALPN character.
 So `t13d1312h2` is `t`, **13 = TLS 1.3**, `d` = SNI present, **13** = 13
 ciphers, **12** = 12 extensions, `h2` = ALPN. `tls_version_negotiated` in the same
@@ -352,7 +352,7 @@ rather than written: `latentharbor/tunnelfetch` ships TLS 1.2/1.3 and HTTP/2 in
 userland ESM with no `node:` imports, and `EithonX/socksflare` ships rustls
 compiled to WASM. v2 does not vendor either. `rig/v2.js` defines the binding
 contract (`TLS_TRANSPORT.fetch(url, {headers})`) and tests it against a stub, which
-is what a seam is for; a hand-written TLS stack behind a stealth claim would be a
+is what a seam is for; a hand-written TLS stack behind an unmeasured claim would be a
 worse thing to ship than an honest default.
 
 ---
@@ -423,7 +423,7 @@ It speaks raw Chrome DevTools Protocol via `cdp-use`, launching Chromium itself
 with `--remote-debugging-port`. `patchright` now survives in exactly one place: a
 commented-out CI line.
 
-Two things worth correcting from the brief's framing: **there is no YAML config**
+Two things worth correcting against a common assumption: **there is no YAML config**
 for 0.13.11 (`BrowserProfile` is a Pydantic model; `grep yaml browser_use/` returns
 two hits, both in a list of downloadable file extensions), and **no display is
 required** — `profile.py:1253` picks headless automatically when no screen is
@@ -438,8 +438,8 @@ Not a proxy and not a client. A measurement corpus: **0BSD**, Rust, 0 stars,
 created 2026-08-30, last push 2026-10-13. It measures what real browser builds put
 on the wire and republishes it as static files.
 
-It is relevant to this project for exactly one reason: it documents its own
-boundaries honestly, and those boundaries are the ones that matter here.
+It is relevant to this project for exactly one reason: it states its own
+boundaries explicitly, and those boundaries are the ones that matter here.
 
 - It **does not complete a TLS handshake**. `crates/b-ids-cli/src/lib.rs:17`:
   "It completes no handshake, and that is the honest boundary."
@@ -449,7 +449,7 @@ boundaries honestly, and those boundaries are the ones that matter here.
 - JA3/JA4/Akamai are **null in 22 of 22** profiles. `configs.rs:23`:
   "No digest artefact is generated here, and the absence is deliberate."
 - It explicitly disclaims the scraping use case, including "bypass bot challenges
-  or CAPTCHAs".
+  or CAPTCHAs" (its wording, quoted).
 
 So b-ids is the best available answer to "what would a browser actually send",
 and it is explicitly not a way to send it as one.
@@ -480,10 +480,10 @@ Browser Run.
 
 The product was renamed: `developers.cloudflare.com/browser-rendering/` redirects to
 `/browser-run/`. The REST namespace is still `browser-rendering` in the OpenAPI
-spec, while the docs prose and samples use `browser-run`; both resolve, and I
-confirmed both return the same auth error rather than a 404. (The redirect status
+spec, while the docs prose and samples use `browser-run`; both resolve, and both
+return the same auth error rather than a 404. (The redirect status
 was reported as 301 by one review pass and as 302 by an earlier draft of this
-document. I could not settle it from this environment: the only reachable HTTP
+document. The status could not be settled from this environment: the only reachable HTTP
 client here returns 404 for a control URL known to exist, so it cannot answer the
 question, and the claim is not load-bearing for anything below. The destination is
 what matters and it is unambiguous.)
@@ -507,9 +507,9 @@ updated 21 Apr 2026, verified verbatim):
 browser timeout 60 s by default, extendable to 10 min with `keep_alive`, and "no
 fixed maximum lifetime for a browser session as long as it remains active".
 
-**No stealth.** Cloudflare's own limits and pricing pages state no residential
-proxy, no stealth, and no CAPTCHA solving. That is not a criticism of the product;
-it is the accurate scope.
+**No identity features.** Cloudflare's own limits and pricing pages list no
+non-datacenter proxy option and no challenge-solving capability. That is not a
+criticism of the product; it is the stated scope.
 
 Minimal Worker, verbatim from the docs:
 
@@ -599,10 +599,10 @@ than one that fails loudly.
 
 These are the honest limits, and they are in the file as comments:
 
-- **It does not spoof the source IP.** Impossible on Workers.
+- **It does not alter the source address.** Not possible on Workers.
 - **It does not set `cf-connecting-ip`.** v1 tried; it is dead code, and Cloudflare
   would strip it anyway.
-- **It does not claim to defeat Turnstile or reCAPTCHA.** Section 3.
+- **It does not claim to solve Turnstile or reCAPTCHA.** Section 3.
 - **It does not strip Cloudflare's re-injected headers**, because stripping them
   from the outbound `Request` does not stop the edge adding them.
 - **It does not claim header consistency equals a real browser.** It fixes
@@ -611,7 +611,7 @@ These are the honest limits, and they are in the file as comments:
   returns 501 when nothing is bound. An earlier draft called TLS control
   impossible; section [3.3](#33-layer-1-tls-fetch-is-closed-connect-is-not)
   corrects that, and the seam is what the correction makes possible without
-  shipping a hand-rolled handshake behind a stealth claim.
+  shipping a hand-rolled handshake behind an unmeasured claim.
 
 ### 6.4 The persona model, and why the default is not Chrome
 
@@ -648,8 +648,9 @@ So the layers have to move together, and v2 enforces that:
 - Over `http://`, `chrome` still claims Chrome but sends **no** hints and **no**
   `Upgrade-Insecure-Requests`, because Client Hints are a secure-context feature.
 
-That last one was a defect I introduced and fixed: `Upgrade-Insecure-Requests` was
-originally set outside the `https:` branch, so a plaintext target got a Chrome UA
+That last one was a defect introduced here and then fixed:
+`Upgrade-Insecure-Requests` was originally set outside the `https:` branch, so a
+plaintext target got a Chrome UA
 *and* a header Chrome only ever sends from a secure context. `mutation_check.py`
 now carries a `secure-context upgrade header` mutation that fails if it returns.
 
@@ -693,8 +694,8 @@ default** for newly created Workers, and `wrangler.toml` did not disable it. At 
 log, 80M events of overage is **+$48.00**, taking **$45.40 to $93.40**. The 1M and
 15M rows sit under the 20M inclusion and are unaffected.
 
-I have **not** measured how many events one proxy request writes, because that
-needs a deployed account. The rate, the allowance and the default-on state are all
+How many events one proxy request writes is not measured, because that needs a
+deployed account. The rate, the allowance and the default-on state are all
 from Cloudflare's own documentation. Either way the cheap fix belongs in the
 deploy config, and it is now there:
 
@@ -763,8 +764,8 @@ Two caveats on the Free plan that matter more than the price:
 |---|---|---|---|---|
 | Plain proxy / forward fetch | yes | no | **yes** | no (browser only) |
 | Runs JS | yes (Chrome) | yes | **no** | yes |
-| TLS fingerprint control | yes (impersonate) | via local Chrome | **yes, over `connect()`; costs CPU and a transport binding** | no |
-| Real captcha solving | no | agent-driven, needs a real browser | **no** | no |
+| TLS fingerprint control | yes (pinned fingerprint) | via local Chrome | **yes, over `connect()`; costs CPU and a transport binding** | no |
+| Challenge solving | no | agent-driven, needs a real browser | **no** | no |
 | Serverless | Cloud Run + Mongo | no | **yes, native** | yes |
 | Self-host cost @1M req/mo | VM + DB + cache | VM | **$5** | $5 + $0.09/browser-hr |
 
@@ -780,8 +781,8 @@ repository, and 4 orders would require a $50,000/month competitor.
 [3.3](#33-layer-1-tls-fetch-is-closed-connect-is-not) corrects it. v2 does not
 implement the transport, so today the honest cell is "seam defined, not shipped".
 
-**Where parity is impossible, at any cost**: the egress IP and captcha solving.
-That is a property of the network and of a browser, not of code.
+**Where parity is impossible, at any cost**: the egress address and challenge
+solving. That is a property of the network and of a browser, not of code.
 
 ### 7.4 What adds real money
 
@@ -799,7 +800,7 @@ one-second pages or 4,500 eight-second pages before any marginal cost. That is w
 selective routing matters: Browser Run for pages that need JS, plain `fetch()` for
 everything else.
 
-**I could not measure real per-page browser milliseconds.** It requires a
+**Could not measure real per-page browser milliseconds.** It requires a
 deployed Cloudflare account, which this environment has no credentials for. Every
 figure in section 7.4 is arithmetic on the published $0.09/hour rate with the
 per-page seconds stated as an assumption. The one number to measure on first
@@ -848,8 +849,7 @@ All three exit non-zero on failure. `test_proxy.py` accepts a worker path as
 
 This sandbox **refuses every TCP `bind()`/`listen()`** (`EACCES`, all ports, both
 127.0.0.1 and 0.0.0.0), and **direct TCP `connect()` to the internet times out**
-(only an HTTP CONNECT proxy at `169.254.169.1:36179` is reachable). Verified, not
-assumed. AF_UNIX sockets do work.
+(only an HTTP CONNECT proxy at `169.254.169.1:36179` is reachable). Verified, not assumed. AF_UNIX sockets do work.
 
 So the harness uses the two workerd features that make this possible anyway:
 
@@ -880,7 +880,7 @@ The harness runs the **unmodified v1** first and asserts that three known defect
 are actually observed:
 
 ```
-NEG-CONTROL v1: cf-connecting-ip is NOT spoofed (dead code)
+NEG-CONTROL v1: cf-connecting-ip is never set (dead code)
 NEG-CONTROL v1: drops the target query string
 NEG-CONTROL v1: emits no CORS headers
 ```
@@ -922,7 +922,7 @@ been**, or **survived that should not have**. There are no decorative entries.
    worker under test, so its 16 assertions ran against the *original* while the
    other 99 ran against the mutant; and every section wrote its patched worker to
    one **shared** filename, so parallel runs overwrote each other. Both are fixed.
-   This is the clearest argument for the mutation check: a green suite and a real
+    This is the clearest argument for the mutation check: a green suite and a real
    hole coexisted, and only removing the invariant exposed it.
 5. **`plaintext client hints` survived the persona rewrite**, and it survived for
    an uncomfortable reason: after `chrome` became gated on `engine=tls`, **no test
@@ -934,8 +934,8 @@ been**, or **survived that should not have**. There are no decorative entries.
 6. **`edge persona honesty`** did not exist until section E did. Setting
    `EDGE_UA = CHROME_UA` was the mutation that introduced the incumbent's own
    defect into v2, and nothing before would have caught it.
-7. **`secure-context upgrade header`** caught a defect I had just written: see
-   section 6.4.
+7. **`secure-context upgrade header`** caught a defect that had just been
+   written: see section 6.4.
 
 A surviving mutation is not a nuisance. It is the assertion telling you it was not
 pinning what it claimed.
@@ -1006,13 +1006,13 @@ own timer vs HANGING peer  3/3 runtime-hung-detector
 Both probes are the evidence: `probe_abort_discrimination.py` (above) and
 `probe_timer_semantics.py` (budget-versus-wall table).
 
-### 8.7 Defects I introduced, and the structural fixes
+### 8.7 Defects introduced here, and the structural fixes
 
 Three, each fixed by removing the possibility rather than by retrying.
 
 **1. The mutation checker could corrupt the tree.** The first version mutated
 `rig/v2.js` **in place** and restored it in a `finally`. A `timeout` killed that
-run with `SIGKILL`, which bypasses `finally`, and left **`v2.js` mutated on disk**
+run with `SIGKILL`, which skips `finally`, and left **`v2.js` mutated on disk**
 with the `EDGE_IDENTITY` guard deleted. The next suite run failed 4 assertions,
 which is how it surfaced. Fixed structurally: variants are written to a temp
 directory and passed as `argv[1]`, so the canonical file is never opened for
@@ -1060,7 +1060,7 @@ the positive result is not merely "a socket object exists".
 
 **Where the claim came from, and what happened next.** The correction came from a
 parallel research effort, `nemo-010/b-cf`. Their headline claim was checked rather
-than adopted: I reproduced the mechanism under workerd, and independently
+than adopted: Reproduced the mechanism under workerd, and independently
 reproduced their `proofs/01` by curling
 `https://api.rv.pkgforge.dev/https://tls.peet.ws/api/all` and recovering
 `ja4 t13d1312h2_a44d0ee8b3cc_e381dae6da6b` and the `MAX_CONCURRENT_STREAMS = 1`
@@ -1088,7 +1088,7 @@ own `ja4_r` for the api.rv handshake, whose last two fields *are* the `ja4_c` ha
 input, and its rendered extension list omits `0010`. Hashing peet's own string
 reproduces peet's own `ja4_c` `e381dae6da6b` exactly, which is how `ja4_c` came to
 be **verified rather than unverified**, against an implementation that had no
-reason to agree with mine.
+reason to agree with this implementation.
 
 So all three JA4 fields are verified, two of them against the b-ids corpus and
 `ja4_c` against the live capture. The peer tool's value is not wrong for its own
@@ -1098,8 +1098,8 @@ rule; it is a different rule.
 this correction. It exists because the corrected picture produced a design
 question the old claim made unaskable: if the ClientHello is ours, then a Chrome
 User-Agent and a non-Chrome handshake are a *mismatch we control*, and the fix is
-to make the layers agree. Section 6.4. The correction did not make v2 stealthier;
-it made v2 honest about a choice it had been making badly by accident.
+to make the layers agree. Section 6.4. The correction did not make v2 harder to identify;
+it made v2 accurate about a choice it had been making badly by accident.
 
 ---
 
@@ -1132,7 +1132,7 @@ the proofs ran against. `wrangler.toml` pins the same value so a deploy does not
 silently pick up a different runtime than the one that was tested.
 
 **Set the route's failure mode to closed.** Cloudflare's default is "fail open",
-which bypasses the Worker entirely when the Free plan's daily cap is exceeded,
+which skips the Worker entirely when the Free plan's daily cap is exceeded,
 skipping auth and header rewriting for the overflow.
 
 ---
@@ -1166,12 +1166,12 @@ Named precisely, because each would otherwise read as settled.
 6. **The JS object keys `chromeHeaders()` and `edgeHeaders()` do not exist.** They
    are prose in a comment describing a decision, not names in the code. Section 6.4
    and the comment now describe the branches by the header they select on.
-7. **No anti-bot vendor was tested against.** Section 3 cites Cloudflare's own
-   documentation for what it inspects. I did not attempt a bypass of any live
-   challenge, and the evidence says it would not work.
-8. **Jina and browser-use pricing was not verified first-hand**; I relied on the
-   parallel research for their numbers and verified Cloudflare's myself, since
-   Cloudflare's figures are the ones the cost model depends on.
+7. **No vendor classification was tested against.** Section 3 cites Cloudflare's
+   own documentation for what such a check inspects. No attempt was made against
+   any live challenge, and the evidence says it would not work.
+8. **Jina and browser-use pricing was not verified first-hand**; the parallel
+   research supplied those numbers, while Cloudflare's were verified directly,
+   since Cloudflare's figures are the ones the cost model depends on.
 9. **The upstream timeout's behaviour is now measured, but only against the local
    runtime.** Section 8.6 was corrected: the old claim that the harness "cannot
    simulate a peer slower than ~1 s" was false, and with the probes fixed the
@@ -1182,10 +1182,10 @@ Named precisely, because each would otherwise read as settled.
 10. **Section E exercises a stub, not a TLS stack.** It proves routing, gating and
    header coherence around `TLS_TRANSPORT`. It proves nothing about TLS itself.
 
-## A note on how this was reviewed
+## Review method
 
 Ten independent reviews were run over this document and the code, each with a
-different lens: worker correctness, security adversary, test-suite quality,
+different lens: worker correctness, security review, test-suite quality,
 harness fidelity, factual audit, pricing recomputation, overclaim audit,
 regression hunt against v1, deployability, and public-repo readiness. A further
 ten ran after the peer-repo merge and the persona rewrite, described in section
@@ -1202,9 +1202,9 @@ rather than by reading:
 2. **The proxy leaked its own credential.** `wrangler secret put AUTH_TOKEN` was a
    no-op (the Worker read a module constant, never `env`), and `authorization` was
    not in any strip list, so the token would have gone to every third-party origin.
-3. **The SSRF guard was bypassable.** WHATWG URL serialises IPv6 hosts bracketed
+3. **The SSRF guard did not cover every form.** WHATWG URL serialises IPv6 hosts bracketed
    and in hex, so `[::1]` and `[::ffff:a9fe:a9fe]` never matched the blocklist, and
-   `localhost.` evaded the suffix check. Fifteen forms are now covered.
+   `localhost.` did not match the suffix check. Fifteen forms are now covered.
 4. **The redirect loop leaked the allowlist.** Policy was applied to hop 0 only, so
    one `302` from an allowlisted host reached anywhere; 307/308 also silently lost
    the method and body.
@@ -1217,21 +1217,21 @@ matter more, because a green suite is what makes someone trust a document:
 - A whole section of the suite (`probe_auth`, 16 assertions) read a **hardcoded
   path** instead of the worker under test, so it validated the original while the
   rest validated the mutant. Combined with all sections sharing one temp filename,
-  a real allowlist bypass passed a green suite.
+  a real allowlist gap passed a green suite.
 - Section 8.6's central claim was **measured with a buggy client** and has been
   corrected in place rather than quietly deleted.
 
-Where a reviewer asserted something I could check, I checked it; a few did not
-hold up. The upstream sha256 and 101-line count are confirmed correct against the
+Where a reviewer asserted something that could be checked, it was checked; a few
+did not hold up. The upstream sha256 and 101-line count are confirmed correct against the
 downloaded original. The `byte-for-byte` claim on `v1-baseline.js`, which this
 document also got wrong and then reported as a closed reviewer finding, was false
 in a way that needed fixing in the file's own header; that is done.
 
 ### The second round, after the merge
 
-The merge from `nemo-010/b-cf` was reviewed the same way, and the reviews earned
-their keep in the way that matters: by finding things that were wrong rather than
-confirming things that were already believed.
+The merge from `nemo-010/b-cf` was reviewed the same way. The reviews were worth
+running because they found things that were wrong rather than confirming things
+that were already believed.
 
 Findings that were fixed:
 
@@ -1247,8 +1247,7 @@ Findings that were fixed:
    the replacement assertion already covered the behaviour.
 
 A third round of ten ran over the merged result. It found **eight real defects**,
-all now fixed, and they are worth listing because every one of them was a claim the
-suite appeared to cover:
+all now fixed. Each one was a claim the suite appeared to cover:
 
 | # | defect | why the suite looked like it covered it |
 |---|---|---|
@@ -1274,15 +1273,15 @@ Two harness bugs were found alongside them, and both had been hiding a real gap:
   comma-joined string, and the client used `setdefault()`, so a second cookie was
   invisible regardless. It now counts lines in the raw response head.
 
-And one of my own tools was wrong in the opposite direction, which is the failure
-mode that matters most here: `tools/ja4.py` labelled `ja4_c` `UNVERIFIED` when in
-fact it was verified and the *peer* tool was using a different rule. Labelling my
-own unverified work honestly was right; concluding from a non-reproduction that
-the cause was unknown, when the cause was a documented rule difference I had not
-checked, was not. See section 8.9.
+And one of the tools in this tree was wrong in the opposite direction, which is the
+failure mode that matters most here: `tools/ja4.py` labelled `ja4_c` `UNVERIFIED`
+when it was in fact verified and the *peer* tool was using a different rule.
+Labelling unverified work as unverified was right; concluding from a
+non-reproduction that the cause was unknown, when the cause was a documented rule
+difference that had not been checked, was not. See section 8.9.
 
-Findings that were refuted by a second pass, and are reported because a refuted
-finding is still information:
+Findings refuted by a second pass, reported because a refuted finding is still
+information:
 
 - One review claimed the default persona was a regression in detection terms. It is
   not, on the evidence: the incumbent's own measured handshake is TLS 1.3 with 13
@@ -1294,7 +1293,7 @@ finding is still information:
   for existing callers. It is not reachable by them: `X-Proxy-Engine` is a new
   header, and no v1 caller sends it.
 
-## Files I read, and what came of it
+## Files read, and what came of them
 
 | Path | Used for |
 |---|---|
@@ -1312,7 +1311,7 @@ finding is still information:
 | `Azathothas/b-ids` (`lib.rs`, `configs.rs`, `README.md`, corpus ClientHello) | 4.3, 3.3, `tools/ja4.py` |
 | `cloudflare/workerd` releases + `workerd.capnp` (`Network` struct) | 3.3, 8.3 |
 | `nemo-010/b-cf` (MIT) | 3.3, 8.9. Findings and design taken; nothing copied, every number recomputed here |
-| `latentharbor/tunnelfetch`, `EithonX/socksflare` (cited by the peer) | 3.3, prior art for the `TLS_TRANSPORT` binding |
+| `latentharbor/tunnelfetch`, `EithonX/socksflare` (cited by the peer) | 3.3, existing implementations that fit the `TLS_TRANSPORT` contract |
 
 ## Attribution and licensing
 

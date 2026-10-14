@@ -5,8 +5,8 @@
 // unmodified.
 //
 // Design rule: never claim a capability the Workers runtime does not have.
-// v1 tried to spoof cf-connecting-ip and to strip Cloudflare-injected headers.
-// Both are impossible. See "What v2 deliberately does not do" at the bottom.
+// v1 tried to write cf-connecting-ip and to strip Cloudflare-injected headers.
+// Neither works. See "What v2 deliberately does not do" at the bottom.
 
 const VERSION = "2.0.0";
 
@@ -208,7 +208,7 @@ function parseTarget(request, allowedHosts) {
  * hostname of `https://[::ffff:169.254.169.254]/` is `[::ffff:a9fe:a9fe]` and
  * would never match a `"::1"` or `"169.254.169.254"` blocklist entry. It also
  * leaves a trailing dot on `localhost.`, which `endsWith(".localhost")` misses.
- * Both were verified bypasses before this function existed.
+ * Both were confirmed gaps before this function existed.
  *
  * IPv4-mapped and IPv4-compatible IPv6 (`::ffff:a.b.c.d`, `::a.b.c.d`) are
  * folded to the dotted quad, because they are the same host.
@@ -285,7 +285,7 @@ function isBlockedHost(hostname) {
 	if (/^fe[89ab][0-9a-f]:/.test(host)) return true; // link-local
 	// NAT64 well-known prefix (RFC 6052) 64:ff9b::/96 and its 2001:db8:... variant.
 	// A blocked v4 target is reachable through these as an embedded address, so
-	// blocking only the v4 form would leave the guard trivially bypassable.
+	// blocking only the v4 form would leave the guard incomplete.
 	if (/^64:ff9b:[0-9a-f]*:/.test(host) || host.startsWith("64:ff9b:")) return true;
 	return false;
 }
@@ -457,8 +457,8 @@ function cookieConsent(request) {
  * X-Proxy-Timeout-Ms a no-op.
  *
  * It is deliberately NOT implemented here: a correct TLS stack needs its own
- * test corpus, and shipping a half-audited one behind a stealth claim would be
- * worse than not offering the option. See RESEARCH.md 3.3 for the design and for
+ * test corpus, and shipping a half-audited one behind an unmeasured claim would
+ * be worse than not offering the option. See RESEARCH.md 3.3 for the design and for
  * prior art that does ship it.
  *
  * `fetch()` is the default and always available. Asking for `tls` with no
@@ -588,7 +588,7 @@ const DROP_FROM_RESPONSE = new Set([
 ]);
 
 // An upstream redirect points at the third-party origin. Handing that to the
-// client makes the client bypass the proxy entirely, so rewrite it back into
+// client would let the client leave the proxy entirely, so rewrite it back into
 // proxy space.
 function rewriteLocation(location, proxyOrigin) {
 	try {
