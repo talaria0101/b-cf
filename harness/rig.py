@@ -155,7 +155,15 @@ export default {
 				});
 			}
 			if (u.pathname === "/__ctl/status") {
-				return new Response("scripted " + code, { status: code });
+				// A null-body status (204, 205, 304) must be constructed with a
+				// null body or the Response constructor throws "Response with null
+				// body status cannot have body". An earlier version passed a string
+				// unconditionally, so the fixture threw, the proxy surfaced it as a
+				// 502, and every assertion about noBody statuses was measuring the
+				// constructor's error rather than the proxy's framing.
+				const nullBody = code === 204 || code === 205 || code === 304
+					|| (code >= 100 && code < 200);
+				return new Response(nullBody ? null : "scripted " + code, { status: code });
 			}
 			// A 304 carrying a Location. RFC 9110 s15.4.5 gives a 304 a Location to
 			// name the selected representation, and 304 is not a redirect: it has
@@ -171,6 +179,37 @@ export default {
 			// Vary: *. Not a list of header names: it is the value that means
 			// "uncacheable, do not key on anything". Appending ", Origin" to it
 			// produces a header RFC 9110 s5.2.2 does not define.
+			// Response headers that are scoped to the ORIGIN that sent them. Replaying
+			// an upstream's value onto the proxy's own origin is never right: the
+			// upstream's Content-Security-Policy describes the upstream's pages, and
+			// its Strict-Transport-Security, Clear-Site-Data and Set-Cookie are scoped
+			// to the upstream's host. The sharpest is Clear-Site-Data, which by
+			// RFC 9535 s4 tells the user agent to clear data for the origin it arrived
+			// on, and here that origin is the proxy.
+			if (u.pathname === "/__ctl/originscoped") {
+				const g = new Headers();
+				g.set("clear-site-data", '"cookies"');
+				g.set("content-security-policy", "default-src 'none'");
+				g.set("strict-transport-security", "max-age=63072000; includeSubDomains; preload");
+				g.set("x-frame-options", "DENY");
+				g.set("cross-origin-opener-policy", "same-origin");
+				g.set("cross-origin-embedder-policy", "require-corp");
+				g.set("permissions-policy", "camera=(), microphone=()");
+				g.set("report-to", '{"group":"upstream"}');
+				g.set("x-ordinary-header", "kept");
+				return new Response("origin-scoped-fixture", { status: 200, headers: g });
+			}
+			// A Location whose scheme is not http(s). rewriteLocation resolves it,
+			// finds a protocol it will not rewrite, and then has to decide: returning
+			// the value verbatim hands the client a URL that leaves the proxy by a
+			// route the allowlist and the SSRF guard never saw.
+			if (u.pathname === "/__ctl/oddscheme") {
+				return new Response("odd-scheme", {
+					status: 201,
+					headers: { location: to || "ftp://attacker.test/x",
+						"x-tap": "oddscheme" },
+				});
+			}
 			if (u.pathname === "/__ctl/varystar") {
 				return new Response("vary-star", {
 					status: 200, headers: { vary: "*", "x-tap": "varystar" },

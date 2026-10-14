@@ -40,8 +40,26 @@ const ALLOWED_HOSTS = [];
  * value means "no allowlist", which is the open-proxy default and is reported by
  * /__config so it cannot be shipped unnoticed.
  */
+/**
+ * Split the `ALLOWED_HOSTS` binding into a list of hostnames.
+ *
+ * A non-string binding is a misconfiguration, and the previous behaviour was to
+ * fall back to the module constant, which is `[]`, meaning NO allowlist. That is
+ * the open-proxy default, so a typo in a config value turned a restricted proxy
+ * into an unrestricted one with no error anywhere: measured with the binding set
+ * to an array, a number and a boolean, all three returned 200 for a host that a
+ * correctly-set string refused with 403.
+ *
+ * A malformed value now REFUSES rather than opening. An empty or whitespace-only
+ * string is still the documented "no allowlist", because that is a deliberate
+ * choice with a name, and it is the shipped default. Anything that is not a
+ * string is not a choice, it is a mistake.
+ */
 function parseHostList(raw, fallback) {
-	if (typeof raw !== "string") return fallback;
+	if (raw === undefined || raw === null) return fallback;
+	if (typeof raw !== "string") {
+		return { misconfigured: typeof raw };
+	}
 	const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
 	return parts;
 }
@@ -57,7 +75,13 @@ const BLOCKED_HOSTS = [
 	"169.254.169.254",
 	"metadata.google.internal",
 	"metadata.goog",
+	// AWS's instance metadata endpoint. The literal here was "instance-data",
+	// which is not a hostname anything resolves: the real name is
+	// instance-data.ec2.internal. A blocked list entry that matches no real
+	// address is indistinguishable from an absent one, and this one was absent.
+	// Both spellings are listed so the guard holds whichever is configured.
 	"instance-data",
+	"instance-data.ec2.internal",
 ];
 
 const MAX_REDIRECTS = 5;
@@ -405,9 +429,45 @@ function validateTarget(candidate, allowedHosts) {
 		url = new URL(candidate);
 	} catch {
 		// Bare host: "example.com/x" -> "https://example.com/x"
+		//
+		// The fallback is only correct when the input really was a bare authority.
+		// The previous version applied it to anything the parser rejected, which is
+		// a much larger set than "no scheme": prepending https:// to a target that
+		// contains a scheme separator collapses it. Measured on the previous
+		// version:
+		//
+		//   "https://exa mple.com/"   -> fetched https://exa/
+		//   "https://[fe80::1%25eth0]/" -> fetched https://https//[fe80::1%eth0]/
+		//
+		// In both cases the proxy issued an outbound request for a host the caller
+		// never named. The SSRF guard and the allowlist still apply to the
+		// substituted host, so this could not reach an internal address; the defect
+		// is the unreviewed substitution, not a guard bypass.
+		//
+		// A target carrying a RAW space is a separate matter and not this defect.
+		// workerd truncates the request-target at the space before the worker runs:
+		// with a worker that only echoes request.url, `GET /exa mple.com/` arrives
+		// as `/exa`. The proxy therefore never sees the malformed target at all, and
+		// fetching `https://exa/` is fetching what the runtime handed it. The
+		// percent-encoded form, which is what a conforming client sends, is
+		// refused here with a 400.
+		//
+		// So the fallback now requires the input to LOOK like a bare authority:
+		// no scheme separator, and nothing that would change the parse when the
+		// scheme is prepended. A caller who means a bare host gets one; a caller
+		// who sent something malformed gets a 400.
+		if (!/^[a-z0-9._~%-]+(?::[0-9]+)?(?:\/|$)/i.test(candidate)) {
+			return { ok: false, status: 400, message: "Invalid target URL" };
+		}
 		try {
 			url = new URL("https://" + candidate);
 		} catch {
+			return { ok: false, status: 400, message: "Invalid target URL" };
+		}
+		// The substitution must reproduce the caller's authority exactly. If it does
+		// not, the parse changed the host and the caller did not name what was
+		// fetched.
+		if (normalizeHost(url.host) !== normalizeHost(candidate.split("/")[0])) {
 			return { ok: false, status: 400, message: "Invalid target URL" };
 		}
 	}
@@ -463,8 +523,20 @@ function isAuthorized(request, authToken) {
 // Request headers
 // ---------------------------------------------------------------------------
 
-// Hop-by-hop headers must not be forwarded (RFC 9110 s7.6.1). host and
-// content-length are here too because the runtime derives both from the URL.
+// Hop-by-hop headers must not be forwarded (RFC 9110 s7.6.1).
+//
+// host and content-length are here for a reason that is not "hop-by-hop": the
+// runtime derives host from the URL and content-length from the buffered body,
+// so a caller-supplied value for either is wrong rather than merely connection-
+// specific. Measured: a bodied POST reaches this worker with
+// `content-length: 3` inbound, and the upstream must see the value that matches
+// the body actually sent, not the caller's claim.
+//
+// Note that HOP_BY_HOP is a static list, so it cannot honour RFC 9110 s7.6.1's
+// other requirement: a proxy must remove the fields a Connection header NAMES,
+// not only a fixed set. A caller sending `Connection: X-Secret` gets X-Secret
+// forwarded upstream today. See CONNECTION_NOMINATED below for the case that is
+// fixed and the case that is not.
 const HOP_BY_HOP = new Set([
 	"connection",
 	"keep-alive",
@@ -573,10 +645,26 @@ function cookieConsent(request) {
  * Compared on the normalised host, so a trailing dot or an IPv6 spelling does not
  * count as a different host.
  */
-function cookieConsentFor(request, targetHost, initialHost) {
+function cookieConsentFor(request, target, initialScheme, initialHost) {
 	if (!cookieConsent(request)) return false;
 	if (initialHost === null) return true;
-	return normalizeHost(targetHost) === normalizeHost(initialHost);
+	// `target` is the hop's URL object, so the host is taken from it rather than
+	// by stringifying it. Passing the object where a hostname was expected made
+	// normalizeHost() compare "https://origin.test/" against "origin.test", which
+	// never matches, and the cookie was dropped on every hop.
+	if (normalizeHost(target.hostname) !== normalizeHost(initialHost)) return false;
+	// The scheme is part of the consent. A caller who approved sending a session
+	// cookie to https://origin.test did not approve an origin that answers 302
+	// Location: http://origin.test/other, and the proxy would emit the cookie in
+	// cleartext on the strength of a decision made over TLS. Measured before this
+	// check existed: the cookie followed an https->http redirect to the same host.
+	//
+	// The rule is asymmetric in the safe direction: plaintext never gains
+	// consent from a TLS caller, and a TLS hop never loses consent from a
+	// plaintext caller, because a caller who chose http for the first hop has
+	// already accepted cleartext for that host.
+	if (initialScheme === "https:" && target.protocol !== "https:") return false;
+	return true;
 }
 
 /**
@@ -606,6 +694,37 @@ function requestedEngine(request) {
 	return raw === ENGINE_TLS ? ENGINE_TLS : ENGINE_FETCH;
 }
 
+/**
+ * The header field names a `Connection` header nominates as connection-specific.
+ *
+ * RFC 9110 s7.6.1: "A proxy that receives a message with a Connection header
+ * field containing a field name in that field's connection-option list MUST
+ * remove that header field before forwarding the message."
+ *
+ * HOP_BY_HOP is a static list, so on its own it does not satisfy that rule: a
+ * caller sending `Connection: X-Secret` had X-Secret forwarded upstream.
+ * Measured before this function existed. `Connection` itself is already in
+ * HOP_BY_HOP, so only the nominated names need collecting here.
+ *
+ * The nominated names are then dropped from the upstream request. The response
+ * direction is NOT handled the same way: workerd strips connection, keep-alive,
+ * upgrade, te and trailer from responses itself, but proxy-authenticate and
+ * proxy-authorization reach the client from an upstream and are not currently
+ * dropped. That is a real gap in the response direction and it is recorded in
+ * RESEARCH.md rather than papered over.
+ */
+function connectionNominated(request) {
+	const raw = request.headers.get("connection");
+	if (!raw) return new Set();
+	const names = new Set();
+	// connection-option is a token list (RFC 9110 s7.6.1), comma separated.
+	for (const token of raw.split(",")) {
+		const name = token.trim().toLowerCase();
+		if (name) names.add(name);
+	}
+	return names;
+}
+
 // Every Client Hint, low-entropy included. When this proxy builds its OWN
 // identity it owns the whole set; when it forwards the caller's identity the
 // caller's hints belong to that identity and are forwarded with it.
@@ -622,10 +741,31 @@ const CLIENT_HINTS = [
 	"sec-ch-ua-wow64",
 ];
 
-function buildUpstreamHeaders(request, target, initialHost) {
+// The caller's headers that may cross a redirect to a host they did not name.
+// These are the ones the proxy sets from its own configuration, so they are the
+// proxy's to re-send rather than the caller's credentials. Everything else the
+// caller supplied is dropped on a cross-host hop.
+const PROXY_OWN_UPSTREAM = new Set([
+	"accept",
+	"accept-language",
+	"user-agent",
+	"accept-encoding",
+	"referer",
+	"origin",
+	// Cookie is here for the same reason it is not in EDGE_IDENTITY: whether it
+	// may cross is decided by cookieConsentFor, which is host-scoped and now
+	// scheme-scoped. Listing it in PROXY_OWN_UPSTREAM only stops the cross-host
+	// rule from dropping it before consent is consulted; it does not grant it.
+	"cookie",
+]);
+
+function buildUpstreamHeaders(request, target, initialScheme, initialHost) {
 	const headers = new Headers();
 	const incoming = request.headers;
-	const forwardCookies = cookieConsentFor(request, target.hostname, initialHost);
+	// Whether this hop is still the host the caller named. Hop 0 always is.
+	const sameHost =
+		initialHost === null || normalizeHost(target.hostname) === normalizeHost(initialHost);
+	const forwardCookies = cookieConsentFor(request, target, initialScheme, initialHost);
 
 	const ua = incoming.get("user-agent") || "";
 	const persona = incoming.get("x-proxy-persona") || "edge";
@@ -642,10 +782,27 @@ function buildUpstreamHeaders(request, target, initialHost) {
 	const overridesIdentity =
 		chromePersona || (persona !== "pass" && looksLikeBotTool(ua));
 
+	const nominated = connectionNominated(request);
+
 	for (const [key, value] of incoming.entries()) {
 		const lower = key.toLowerCase();
 		if (HOP_BY_HOP.has(lower) || EDGE_IDENTITY.has(lower) || OWNED_HEADERS.has(lower)) continue;
+		if (nominated.has(lower)) continue;
 		if (lower === "cookie" && !forwardCookies) continue;
+		// Every OTHER caller-supplied header is dropped when this hop is not the
+		// host the caller named.
+		//
+		// The proxy follows the redirect itself, server-side. The caller consented
+		// to sending their headers to the host in the URL they wrote, not to
+		// whatever that host then names. Only the proxy's own headers and the
+		// identity it chose go to the second host.
+		//
+		// Measured before this rule: `X-Forwarded-Authorization`, `X-Api-Key`,
+		// `X-Auth-Token` and `X-Tenant-Id` all arrived at a redirect target the
+		// caller never named, alongside 33 further unnamed headers. `Authorization`
+		// and `Cookie` were already dropped there by OWNED_HEADERS and the consent
+		// check; these were the rest.
+		if (!sameHost && !PROXY_OWN_UPSTREAM.has(lower)) continue;
 		// The inconsistency this exists to prevent: the proxy rewrites the UA and
 		// leaves the caller's `sec-ch-ua-platform: "macOS"` beside it. v1 shipped
 		// exactly that combination. A hint only survives when the caller's own UA
@@ -718,6 +875,37 @@ function buildUpstreamHeaders(request, target, initialHost) {
 // genuinely unsafe to echo.
 const DROP_FROM_RESPONSE = new Set([
 	"transfer-encoding",
+	// Headers whose effect is scoped to the ORIGIN that emitted them. A response
+	// served from the proxy's origin is a page on the proxy's host, so an
+	// upstream's copy of these describes a document the caller is not being
+	// served: its Content-Security-Policy governs the upstream's pages, its HSTS
+	// pins the upstream's hostname, its X-Frame-Options and Permissions-Policy
+	// were set for the upstream's embedding context. Replaying them applies
+	// another party's policy to this host, which neither party asked for.
+	//
+	// Clear-Site-Data is the sharpest of these. RFC 9535 s4 scopes it to the
+	// origin the response arrived from, so an upstream can arm it against the
+	// PROXY's own origin and have the user agent clear storage and cookies there.
+	// The shipped default is an open proxy, so this needs no credential to reach.
+	"clear-site-data",
+	"content-security-policy",
+	"content-security-policy-report-only",
+	"strict-transport-security",
+	"public-key-pins",
+	"x-frame-options",
+	"cross-origin-opener-policy",
+	"cross-origin-embedder-policy",
+	"cross-origin-resource-policy",
+	"permissions-policy",
+	"report-to",
+	"nel",
+	// Set-Cookie is handled separately in buildResponseHeaders, which appends the
+	// individual lines rather than joining them. It is NOT dropped: a cookie set
+	// by the origin is the origin's business, and cookie forwarding here is the
+	// caller's opt-in, not a response-header question. A Set-Cookie from a third
+	// party is scoped to the PROXY's host, which is a real consequence of the
+	// proxy existing, and it is documented in section 2.4 rather than silently
+	// filtered. See README "Scope" and RESEARCH.md 2.4.
 	// The origin's own credential opt-in must not survive. applyCors reflects
 	// the caller's Origin, and pairing a reflected ACAO with a forwarded ACAC is
 	// exactly the combination this proxy's CORS comment says it refuses to
@@ -742,9 +930,21 @@ function rewriteLocation(location, proxyOrigin, base) {
 	try {
 		resolved = base ? new URL(location, base) : new URL(location);
 	} catch {
-		return location;
+		// Unparseable, so it cannot be rewritten and must not be forwarded either.
+		// The same reasoning as the non-http(s) branch below.
+		return null;
 	}
-	if (resolved.protocol !== "http:" && resolved.protocol !== "https:") return location;
+	// A Location that is not http(s) cannot be rewritten into proxy space, because
+	// proxy space is an http(s) URL. It must not be returned verbatim either:
+	// this function exists so the client never leaves the proxy, and
+	// `ftp://attacker.test/x`, `javascript:...` and `data:...` all send it
+	// somewhere the allowlist and the address guard never evaluated. An earlier
+	// version returned `location` on this branch, which is the one path where the
+	// function did the opposite of what its own comment says.
+	//
+	// Measured on the version that returned it verbatim: all three arrived at the
+	// client intact from a third-party upstream, unauthenticated.
+	if (resolved.protocol !== "http:" && resolved.protocol !== "https:") return null;
 	return proxyOrigin + "/" + resolved.href;
 }
 
@@ -754,7 +954,14 @@ function buildResponseHeaders(upstream, proxyOrigin, base) {
 		const lower = key.toLowerCase();
 		if (DROP_FROM_RESPONSE.has(lower)) continue;
 		if (lower === "location") {
-			out.set(key, rewriteLocation(value, proxyOrigin, base));
+			// A Location this proxy cannot express is DROPPED rather than passed
+			// through. Dropping it means the client sees a response with no
+			// redirect, which is a degraded navigation; forwarding it means the
+			// client leaves the proxy by a path no policy here evaluated. The
+			// second is the failure the proxy exists to prevent, and it is not
+			// recoverable by the caller once followed.
+			const rewritten = rewriteLocation(value, proxyOrigin, base);
+			if (rewritten !== null) out.set(key, rewritten);
 			continue;
 		}
 		// Do not pass Cloudflare-injected response headers through to the client.
@@ -866,9 +1073,26 @@ export default {
 		}
 
 		// ALLOWED_HOSTS from the binding is a comma-separated string; the module
-		// constant is the fallback. A malformed or empty value means "no
+		// constant is the fallback. An empty or whitespace-only value means "no
 		// allowlist", which is the open-proxy default.
-		const allowedHosts = parseHostList(env && env.ALLOWED_HOSTS, ALLOWED_HOSTS);
+		//
+		// A value that is not a string at all is a misconfiguration rather than a
+		// choice, and it REFUSES rather than falling back to the open default. See
+		// parseHostList: on the previous behaviour an array, a number or a boolean
+		// binding all produced NO allowlist, and any host then returned 200.
+		const parsedHosts = parseHostList(env && env.ALLOWED_HOSTS, ALLOWED_HOSTS);
+		if (!Array.isArray(parsedHosts)) {
+			const bad = new Headers();
+			applyCors(request, bad);
+			return jsonError(
+				500,
+				"ALLOWED_HOSTS is configured as " + parsedHosts.misconfigured +
+					", not a string. Refusing rather than serving with no allowlist. " +
+					'Set it as a comma-separated string in [vars], e.g. "example.com,other.test".',
+				bad,
+			);
+		}
+		const allowedHosts = parsedHosts;
 
 		const parsed = parseTarget(request, allowedHosts);
 		if (parsed.ok === false && parsed.message === "__CONFIG__") {
@@ -949,6 +1173,7 @@ export default {
 		// The host the caller named. Cookie consent is scoped to it: a redirect to
 		// a different host does not inherit it.
 		const initialHost = target.hostname;
+		const initialScheme = target.protocol;
 
 		// Follow redirects by hand so each hop gets freshly built headers, the
 		// allowlist and SSRF blocklist apply to EVERY hop, and the final Location
@@ -995,7 +1220,7 @@ export default {
 			try {
 				const init = {
 					method: hopMethod,
-					headers: buildUpstreamHeaders(request, current, initialHost),
+					headers: buildUpstreamHeaders(request, current, initialScheme, initialHost),
 					body: hopBody,
 					signal: controller.signal,
 				};

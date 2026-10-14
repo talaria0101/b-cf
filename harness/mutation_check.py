@@ -255,7 +255,7 @@ MUTATIONS = [
     ),
     (
         "NUL byte in target",
-        r'if \(/\[\\u0000-\\u001f\\u007f\]/\.test\(candidate\)\) \{',
+        r'\tif \(/\[\\u0000-\\u001f\\u007f\]/\.test\(candidate\)\) \{',
         'if (false) {',
         "refusing a target containing a NUL, which defeats the scheme check",
     ),
@@ -343,8 +343,8 @@ MUTATIONS = [
         # against hop 0, it rode a 302 to whatever host the origin chose, which is
         # the leak the opt-in exists to bound.
         "cookie consent is host-scoped",
-        r'\treturn normalizeHost\(targetHost\) === normalizeHost\(initialHost\);',
-        '\treturn true;',
+        r'\tif \(normalizeHost\(target\.hostname\) !== normalizeHost\(initialHost\)\) return false;',
+        '\tif (false) return false;',
         "scoping cookie consent to the host the caller named",
     ),
     (
@@ -400,6 +400,83 @@ MUTATIONS = [
         '\t\t\t\t\t\theaders: init.headers,\n\t\t\t\t\t\tsignal: init.signal,',
         "passing method and body to a body-capable TLS_TRANSPORT",
     ),
+    # --- round 4: the security lens. Each entry names the measurement that found
+    # the defect, so the reason the assertion exists survives the fix.
+    (
+        # RFC 9535 s4 scopes Clear-Site-Data to the origin the response arrived on.
+        # An upstream can arm it against the PROXY's origin and the shipped default
+        # is an open proxy, so this needed no credential at all.
+        "origin-scoped response headers",
+        r'\t"clear-site-data",\n',
+        '',
+        "dropping an origin-scoped header (Clear-Site-Data) an upstream set for itself",
+    ),
+    (
+        # rewriteLocation exists so the client never leaves the proxy. Returning the
+        # value verbatim for a non-http(s) scheme was the one path where it did:
+        # ftp://, javascript: and data: all arrived at the client intact.
+        "non-http Location is dropped",
+        r'\tif \(resolved\.protocol !== "http:" && resolved\.protocol !== "https:"\) return null;',
+        '\tif (false) return null;',
+        "refusing to pass a Location whose scheme is not http(s) straight to the client",
+    ),
+    (
+        # Consent was scoped to the host but not the scheme, so a caller who approved
+        # a cookie over TLS had it emitted in cleartext after the origin answered
+        # 302 Location: http://the-same-host/other.
+        "cookie consent is scheme-scoped",
+        r'\tif \(initialScheme === "https:" && target\.protocol !== "https:"\) return false;',
+        '',
+        "requiring the same scheme before sending a consented cookie on a later hop",
+    ),
+    (
+        # The proxy follows redirects server-side, so the caller consented to the host
+        # they wrote, not to whatever that host named. Authorization and Cookie were
+        # already stopped on a cross-host hop; X-Forwarded-Authorization, X-Api-Key,
+        # X-Auth-Token and 33 other unnamed headers were not.
+        "cross-host hops drop caller headers",
+        r'\t\tif \(!sameHost && !PROXY_OWN_UPSTREAM\.has\(lower\)\) continue;',
+        '',
+        "dropping the caller's other headers on a hop to a host they did not name",
+    ),
+    (
+        # RFC 9110 s7.6.1: a proxy must remove the header fields a Connection header
+        # NAMES, not only a fixed set. Measured: `Connection: X-Secret` forwarded
+        # X-Secret upstream.
+        "Connection-nominated headers",
+        r'\t\tif \(nominated\.has\(lower\)\) continue;',
+        '',
+        "removing the header fields a Connection header nominates (RFC 9110 s7.6.1)",
+    ),
+    (
+        # The bare-host fallback ran on anything the URL parser rejected, which is a
+        # much larger set than "no scheme": prepending https:// to
+        # "https://[fe80::1%25eth0]/" collapses it.
+        # The invariant is "a target that is not a bare authority is refused", and
+        # it is enforced by TWO guards: a shape test before the substitution and a
+        # round-trip test after it. A mutation that removes only the shape test
+        # survived, because the round-trip check rejects the same inputs. Both are
+        # kept, so this mutation removes the pair and restores the original
+        # unconditional fallback.
+        #
+        # Measured: with the pair removed, "/https://[fe80::1%25eth0]/" fetches
+        # https://https//[fe80::1%eth0]/ again and four assertions fail.
+        "bare-host fallback is narrow",
+        r'\t\t// Bare host: "example\.com/x".*?\n\t\tif \(normalizeHost\(url\.host\) !== normalizeHost\(candidate\.split\("/"\)\[0\]\)\) \{\n\t\t\treturn \{ ok: false, status: 400, message: "Invalid target URL" \};\n\t\t\}\n',
+        '\t\ttry {\n\t\t\turl = new URL("https://" + candidate);\n'
+        '\t\t} catch {\n'
+        '\t\t\treturn { ok: false, status: 400, message: "Invalid target URL" };\n\t\t}\n',
+        "refusing a target that is not a bare authority before substituting a scheme",
+        re.M | re.S,
+    ),
+    (
+        # A non-string binding fell back to the module constant, which is [], so a
+        # typo turned a restricted proxy into an unrestricted one with no error.
+        "non-string allowlist refuses",
+        r'\t\tif \(!Array\.isArray\(parsedHosts\)\) \{',
+        '\t\tif (false) {',
+        "refusing a non-string ALLOWED_HOSTS binding instead of serving with no allowlist",
+    ),
 ]
 
 # Cost guards. A survivor here means the suite lacks a cost assertion, not that a
@@ -448,7 +525,15 @@ def run_suite(path_to_v2, timeout=420):
 
 def prepare(item, tmp):
     name, pattern, replacement = item[0], item[1], item[2]
-    mutated, n = re.subn(pattern, replacement, ORIGINAL, flags=re.M)
+    # A pattern may carry its own flags as a 5th tuple element. `re.M` is the
+    # default because almost every anchor here is `^...$` per line. A pattern that
+    # spans lines with .*? needs re.S as well, and silently lacking it is a quiet
+    # failure: the substitution matched a shorter run, removed less than intended,
+    # and the suite passed against a mutant that did not remove the invariant. That
+    # is how "bare-host fallback is narrow" reported as a survivor while the same
+    # substitution applied by hand failed four assertions.
+    flags = item[4] if len(item) > 4 else re.M
+    mutated, n = re.subn(pattern, replacement, ORIGINAL, flags=flags)
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     path = os.path.join(tmp, "v2-%s.js" % slug)
     if n == 0 or mutated == ORIGINAL:

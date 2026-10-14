@@ -617,6 +617,13 @@ than one that fails loudly.
 | An `ALLOWED_HOSTS` entry may carry a port | The port is ignored. Earlier, an entry written as `origin.test:8443` matched nothing at all and refused every request, including the one it named. |
 | A `304` is returned, not followed | Earlier, any `3xx` carrying a `Location` was consumed as a redirect hop. `304` is not a redirect (RFC 9110 s15.4.5): it has no body, and its `Location` names the selected representation for a conditional request. Such a response is now passed through. |
 | `Location` is resolved against the hop it came from | A relative or protocol-relative `Location` is made absolute and rewritten into proxy space. Earlier, a relative `Location` was passed to the client unchanged, and a protocol-relative one named the host directly, in both cases sending the client off the proxy. |
+| Origin-scoped response headers are dropped | `Content-Security-Policy`, `Strict-Transport-Security`, `X-Frame-Options`, `Permissions-Policy`, `COOP`, `COEP`, `CORP`, `Report-To`, `NEL` and `Clear-Site-Data` from an upstream no longer reach the client. They are scoped to the origin that emitted them (RFC 9535 s4 for `Clear-Site-Data`), and a response served from the proxy's host is not the upstream's document. |
+| A `Location` this proxy cannot express is dropped | A `ftp:`, `javascript:` or `data:` Location on any status is removed rather than passed through. Such a value cannot be rewritten into proxy space, and forwarding it sends the client off the proxy by a path no policy here evaluated. |
+| Caller headers do not cross a cross-host redirect | On a hop to a host the caller did not name, only the proxy's own headers are sent. `Authorization` and `Cookie` were already dropped; `X-Forwarded-Authorization`, `X-Api-Key`, `X-Auth-Token` and any other caller-supplied header now are too. |
+| A header named by `Connection` is not forwarded | RFC 9110 s7.6.1 requires it. `Connection: X-Secret` previously forwarded `X-Secret` upstream. |
+| Cookie consent covers the scheme | A consented cookie is not sent to an `http:` hop when the caller named an `https:` target. An origin answering `302 Location: http://same-host/other` previously received the cookie in cleartext. |
+| A non-string `ALLOWED_HOSTS` is refused | A binding that is an array, a number or a boolean returns **500** rather than falling back to the open-proxy default. An empty or whitespace-only string still means "no allowlist". |
+| A target that is not a bare authority is refused | The bare-host fallback required a shape match and a round-trip check. `"https://[fe80::1%25eth0]/"` previously fetched `https://https//[fe80::1%eth0]/`, a host the caller never named.
 
 ### 6.3 What it deliberately does not do
 
@@ -878,12 +885,14 @@ rig/v1-baseline.js    v1, reformatted, with a 3-line provenance header (see 1)
 wrangler.toml         deploy config
 LICENSE               0BSD
 harness/rig.py        runs a worker under real workerd, with an in-process TAP origin
-harness/test_proxy.py  313 assertion rows in 11 sections, of which 14 are controls:
+harness/test_proxy.py  402 assertion rows in 13 sections, of which 30 are controls:
                       152 v2 (C), 17 auth+allowlist (D), 21 engine/persona (E),
                       8 engine/body (F), 12 hostlist (G), 11 redirect scoping (H),
-                      4 response edges (J), 65 header coverage (K), 23 CORS (L),
-                      6 v1 observation (A/B), of which 3 NEG-CONTROL and 11 CONTROL
-harness/mutation_check.py  51 mutations, each required to be caught
+                      4 response edges (J), 67 header coverage (K), 23 CORS (L),
+                      35 previously-unpinned branches (M), 13 origin-scoped
+                      response headers (N), 30 security round 4 (O),
+                      9 v1 observation (A/B), of which 3 NEG-CONTROL and 27 CONTROL
+harness/mutation_check.py  58 mutations, each required to be caught
 harness/probe_raw_socket.py  the Layer 1 measurement: is connect() a raw stream?
 harness/probe_*.py    the five probes: four behind the timeout findings, plus
                       probe_raw_socket.py behind section 3.3
@@ -965,11 +974,11 @@ flag is read.
 ### 8.5 Mutation check
 
 A negative control proves the harness catches defects that already exist. It does
-**not** prove it would catch a regression introduced into v2. So 51 single-line
+**not** prove it would catch a regression introduced into v2. So 58 single-line
 mutations are applied to a copy of v2, and the suite must fail for each:
 
 ```
-51/51 mutations caught
+58/58 mutations caught
 OK: every mutation was detected, so the v2 assertions have teeth.
 ```
 
@@ -1327,49 +1336,6 @@ downloaded original. The `byte-for-byte` claim on `v1-baseline.js`, which this
 document also got wrong and then reported as a closed reviewer finding, was false
 in a way that needed fixing in the file's own header; that is done.
 
-### The third round, after the neutral-register rewrite
-
-Eight further lenses, run over the same tree. The code defects they found are
-listed in section 6.2 and fixed with assertions; what is worth recording here is
-the pricing lens, because it found a defect in this document rather than in the
-worker.
-
-Every pricing and limit claim was recomputed against Cloudflare's own
-documentation, fetched 2026-10-14. Of 51 claims checked, 41 matched exactly,
-including every headline figure: $0.30/M requests, $0.02/M CPU-ms, $0.60/M log
-events, the $5.00 minimum, Cloudflare's own worked examples at $8.00 and $45.40,
-100,000 requests/day, Error 1027, 10 ms Free CPU, $0.09/browser-hour, 64 MiB, the
-20-minute runtime-update grace period, 6 MiB Markdown-for-Agents, and the 300-second
-Turnstile lifetime. The remaining findings, all now corrected in place:
-
-- **A dated pricing change was missing.** Workers Logs moves to Cloudflare
-  Observability pricing on 2026-12-01, and the $93.40 figure in 7.1 is a model
-  that stops applying on that date. The notice is quoted in 7.1 now.
-- **An unverifiable default was asserted as fact.** Section 7.2 claimed "the
-  default route mode is fail open". Cloudflare's limits page shows both modes in a
-  table with no default marked, and nothing else in their documentation states it
-  either. The claim is removed rather than softened, and the operator is told where
-  to check. Section 9 depended on it.
-- **A quotation was attributed to two sources and exists on one.** The Free-plan
-  daily limit is on both the limits and pricing pages; "resetting at midnight UTC"
-  is on the limits page only.
-- **Three numbers had drifted by days.** The changelog feed holds 1,344 items
-  against the 1,341 recorded, and the tag counts moved with it. The counting method
-  was also unstated and mattered: "first category" gives Workers 174, "appears in
-  any category" gives 260. The method is now written down.
-- **An omission with teeth.** Subrequests are priced at nothing, correctly, but the
-  runtime also caps them at 50 per invocation on Free and 10,000 on Paid, counting
-  each redirect hop. Section 7.1 now states the ceiling and the measured headroom.
-- **One claim was outside its own sources.** The reCAPTCHA two-minute lifetime comes
-  from Google, not Cloudflare, so it cannot be verified from the sources this
-  document cites. Marked as such.
-
-The generalisable lesson, and the reason it is written down rather than just
-fixed: the 4.4 sweep looked for price *increases* in the changelog and found none.
-The Workers Logs change is a pricing change, and it reached the docs through the
-pricing page and a blog post rather than a Workers-tagged changelog entry. A
-pricing claim sourced only from the changelog is not a survey of pricing.
-
 ### The second round, after the merge
 
 The merge from `nemo-010/b-cf` was reviewed the same way. The reviews were worth
@@ -1435,6 +1401,143 @@ information:
 - One review claimed the 501 for a missing `TLS_TRANSPORT` was a breaking change
   for existing callers. It is not reachable by them: `X-Proxy-Engine` is a new
   header, and no v1 caller sends it.
+
+### The third round, after the neutral-register rewrite
+
+Eight further lenses, run over the same tree. The code defects they found are
+listed in section 6.2 and fixed with assertions; what is worth recording here is
+the pricing lens, because it found a defect in this document rather than in the
+worker.
+
+Every pricing and limit claim was recomputed against Cloudflare's own
+documentation, fetched 2026-10-14. Of 51 claims checked, 41 matched exactly,
+including every headline figure: $0.30/M requests, $0.02/M CPU-ms, $0.60/M log
+events, the $5.00 minimum, Cloudflare's own worked examples at $8.00 and $45.40,
+100,000 requests/day, Error 1027, 10 ms Free CPU, $0.09/browser-hour, 64 MiB, the
+20-minute runtime-update grace period, 6 MiB Markdown-for-Agents, and the 300-second
+Turnstile lifetime. The remaining findings, all now corrected in place:
+
+- **A dated pricing change was missing.** Workers Logs moves to Cloudflare
+  Observability pricing on 2026-12-01, and the $93.40 figure in 7.1 is a model
+  that stops applying on that date. The notice is quoted in 7.1 now.
+- **An unverifiable default was asserted as fact.** Section 7.2 claimed "the
+  default route mode is fail open". Cloudflare's limits page shows both modes in a
+  table with no default marked, and nothing else in their documentation states it
+  either. The claim is removed rather than softened, and the operator is told where
+  to check. Section 9 depended on it.
+- **A quotation was attributed to two sources and exists on one.** The Free-plan
+  daily limit is on both the limits and pricing pages; "resetting at midnight UTC"
+  is on the limits page only.
+- **Three numbers had drifted by days.** The changelog feed holds 1,344 items
+  against the 1,341 recorded, and the tag counts moved with it. The counting method
+  was also unstated and mattered: "first category" gives Workers 174, "appears in
+  any category" gives 260. The method is now written down.
+- **An omission with teeth.** Subrequests are priced at nothing, correctly, but the
+  runtime also caps them at 50 per invocation on Free and 10,000 on Paid, counting
+  each redirect hop. Section 7.1 now states the ceiling and the measured headroom.
+- **One claim was outside its own sources.** The reCAPTCHA two-minute lifetime comes
+  from Google, not Cloudflare, so it cannot be verified from the sources this
+  document cites. Marked as such.
+
+The generalisable lesson, and the reason it is written down rather than just
+fixed: the 4.4 sweep looked for price *increases* in the changelog and found none.
+The Workers Logs change is a pricing change, and it reached the docs through the
+pricing page and a blog post rather than a Workers-tagged changelog entry. A
+pricing claim sourced only from the changelog is not a survey of pricing.
+
+### The fourth round, and a harness defect that outranked the findings
+
+Eight lenses ran over the tree again: security, test-suite quality, harness
+fidelity, documentation accuracy, pricing, neutral register, deploy and packaging,
+and consistency. The security and test-quality lenses each found real defects.
+Everything below was reproduced with a standalone probe against the real runtime
+before it was fixed, and pinned after.
+
+**Six defects in the worker**, each now a mutation that must be caught:
+
+1. **An upstream could set the proxy's origin-scoped security headers.**
+   `Clear-Site-Data`, `Content-Security-Policy`, `Strict-Transport-Security`,
+   `X-Frame-Options`, `Permissions-Policy`, `COOP`, `COEP` and `Report-To` were
+   copied verbatim onto a response served from the proxy's own host. RFC 9535 s4
+   scopes `Clear-Site-Data` to the origin it arrived on, so an arbitrary upstream
+   could arm it against the proxy's origin and have the user agent clear storage
+   there. The shipped default is an open proxy, so this needed no credential.
+2. **A non-http(s) `Location` reached the client verbatim.** `rewriteLocation`
+   exists so the client never leaves the proxy, and the one branch where it
+   returned the input unchanged was the scheme check: `ftp://`, `javascript:` and
+   `data:` all arrived intact from a third party.
+3. **Cookie consent covered the host but not the scheme.** A caller who named
+   `https://origin.test` and consented to the cookie had it emitted in cleartext
+   after the origin answered `302 Location: http://origin.test/other`.
+4. **Every other caller header rode a cross-host redirect.** `Authorization` and
+   `Cookie` were stopped; `X-Forwarded-Authorization`, `X-Api-Key`, `X-Auth-Token`,
+   `X-Tenant-Id` and 33 further unnamed headers were not. The proxy follows the
+   redirect itself, so the caller consented to the host they wrote.
+5. **A header named by `Connection` was forwarded.** RFC 9110 s7.6.1 requires a
+   proxy to remove the fields a `Connection` header names. `HOP_BY_HOP` is a static
+   set, so `Connection: X-Secret` forwarded `X-Secret`.
+6. **A non-string `ALLOWED_HOSTS` silently disabled the allowlist.** The fallback
+   was the module constant, which is `[]`, meaning the open-proxy default. An
+   array, a number and a boolean each turned a restricted proxy into an
+   unrestricted one with no error anywhere. It now returns 500.
+
+Plus one narrowing of a target-parsing rule: the bare-host fallback ran on
+anything the URL parser rejected, which is a much larger set than "no scheme", so
+`"https://[fe80::1%25eth0]/"` fetched `https://https//[fe80::1%eth0]/`. The
+address guard and the allowlist still applied to the substituted host, so this was
+an unreviewed substitution rather than a guard bypass. It now requires a shape
+match and a round-trip check.
+
+**A harness defect that mattered more than any of them.** The v1 baseline section
+printed its rows and was never folded into the exit status, so a v1 assertion could
+fail while the run reported `VALID` and `OVERALL: PASS` with exit 0. Reproduced
+before the fix: changing v1's hardcoded User-Agent from `Safari/605.1.15` to
+`Chrome/999.0.0.0` in a copy of the tree produced
+
+```
+FAIL  v1: rewrites a curl UA to a fixed Safari 18.5 string
+VALID: all 14 control assertions fired.
+OVERALL: PASS
+```
+
+with exit status 0. A red row inside a green report is worse than a missing row,
+because it reads as a known-and-accepted failure. Nine assertions were ungated.
+
+Three more harness defects, each a row that could not fail for the reason it
+claimed:
+
+- **`content-length` was a tautology.** The row sent a header with no body, and
+  the client discards a caller-supplied `Content-Length` when there is no payload,
+  so the header never reached the worker and its absence proved nothing. The
+  invariant that actually holds is that the upstream's length is DERIVED from the
+  body, and that is what the row now asserts.
+- **The CORS allow-header rows were substring matches.** `"accept"` is a substring
+  of `"x-proxy-accept-language"`, so deleting `Accept` from the advertised list
+  left the suite green, and so did deleting `Accept-Language`. Matched against the
+  split list now.
+- **The source-scanning CORS row could not see most reads.** It matched
+  `request.headers.get` and `incoming.headers.get`, but `incoming` *is* a Headers
+  object, so `incoming.get` and `incoming.has` were invisible to it. It reported a
+  complete list while checking four of six.
+
+**And one where the assertion was the thing that was wrong.** `noBody` statuses
+could not be measured because the TAP fixture called `new Response(body, {status:
+204})`, which throws. Every assertion about a 204 was reading the constructor's
+error. The fixture builds null-body statuses correctly now. In the same spirit, a
+target carrying a RAW space turned out not to be a proxy defect at all: workerd
+truncates the request-target at the space before the worker runs, so the proxy
+never sees the malformed target. The percent-encoded form is refused with 400.
+
+**A mutation-check defect worth recording.** `prepare()` applied `flags=re.M` to
+every pattern, so a mutation written to span lines with `.*?` silently matched a
+shorter run, removed less than intended, and reported as a survivor. The same
+substitution applied by hand failed four assertions. Patterns may now carry their
+own flags.
+
+The generalisable lesson: two of the eight lenses found defects in the **harness**
+rather than in the worker, and the harness defect was the one that would have let
+a future regression pass unnoticed. A green suite is a claim about the suite, not
+about the code, and that claim needs its own check.
 
 ## Files read, and what came of them
 

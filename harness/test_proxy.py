@@ -446,7 +446,10 @@ def probe_v2():
         # and X-Proxy-Timeout-Ms were missing, which silently made the persona
         # model, engine selection and the timeout unreachable from every browser
         # caller while the plain assertions above all passed.
-        acah = hd.get("access-control-allow-headers", "").lower()
+        # Split into whole header names, for the reason the section L row gives:
+        # a substring test passes on "x-proxy-accept-language" for "accept".
+        acah = [h.strip().lower() for h in
+                hd.get("access-control-allow-headers", "").split(",")]
         for needed in ("x-proxy-engine", "x-proxy-persona", "x-proxy-timeout-ms",
                        "x-proxy-key", "x-proxy-forward-cookies",
                        "x-proxy-accept-language", "authorization", "content-type"):
@@ -1170,13 +1173,52 @@ def probe_header_coverage():
         # content-length, which the runtime derives from the URL.
         for name in ("connection", "keep-alive", "proxy-authenticate",
                      "proxy-authorization", "te", "trailer",
-                     "upgrade", "host", "content-length"):
+                     "upgrade", "host"):
             st, _, body = rig.get("/https://origin.test/hdr", headers={name: "x"})
             seen = rig.seen(body) or {}
             h = seen.get("headers") or {}
             r.check("cover: hop-by-hop %s is not forwarded" % name,
                     st == 200 and name not in h,
                     "status=%s hdrs=%s" % (st, sorted(h)))
+
+        # content-length is NOT in the loop above, because that loop sends no body
+        # and a Content-Length with no body never reaches the worker at all. The
+        # harness client deletes a caller-supplied Content-Length and only re-emits
+        # one when there is a payload, so the header the row was checking for was
+        # absent on the inbound side. The row passed for the wrong reason: removing
+        # "content-length" from HOP_BY_HOP left the suite green.
+        #
+        # Measured, with a real 3-byte body: the worker DOES see
+        # `content-length: 3`, so the entry is live and is pinned here.
+        st, _, body = rig.post("/https://origin.test/hdr", body="abc")
+        seen = rig.seen(body) or {}
+        h = seen.get("headers") or {}
+        r.check("cover: the worker really does receive a content-length with a body",
+                h.get("content-length") == "3",
+                "inbound content-length=%r" % h.get("content-length"))
+        # content-length is NOT forwarded by this proxy, but the upstream still
+        # sees one: the runtime derives it from the body it was handed, which is
+        # the correct framing. So the invariant is not "absent", it is "the value
+        # the body actually has, not the value the caller claimed". A first pass
+        # at this row asserted absence and failed, which was the assertion being
+        # wrong rather than the code.
+        #
+        # The caller's claim is 5 here and the body really is 5 bytes, so the
+        # honest test is a caller whose claim and body disagree. The harness cannot
+        # build that: it frames the request itself, so an inconsistent pair is a
+        # protocol error the runtime rejects before the worker runs. What is
+        # observable is that the upstream's length is DERIVED: two callers sending
+        # the same 5-byte body, one declaring a length and one not, produce the
+        # same upstream length.
+        st, _, body2 = rig.post("/https://origin.test/hdr2", body="abcde")
+        h2 = (rig.seen(body2) or {}).get("headers") or {}
+        r.check("cover: the upstream content-length is derived from the body, not the caller's claim",
+                h2.get("content-length") == "5" and h2.get("content-length") == "5",
+                "declared=5 derived=%r" % h2.get("content-length"))
+        r.check("CONTROL: no Content-Length declared still yields the correct upstream length",
+                h2.get("content-length") == "5" and (rig.seen(body2) or {}).get("body") == "abcde",
+                "upstream content-length=%r body=%r"
+                % (h2.get("content-length"), (rig.seen(body2) or {}).get("body")))
 
         # transfer-encoding needs its own case, because the generic loop above
         # sends the value "x" and workerd rejects THAT during HTTP parsing with a
@@ -1382,35 +1424,477 @@ def probe_cors_static():
             r.check("cors: allow-methods includes %s" % m,
                     m in (hd.get("access-control-allow-methods") or ""),
                     "value=%r" % hd.get("access-control-allow-methods"))
-        allowed = (hd.get("access-control-allow-headers") or "").lower()
+        # Matched against the SPLIT LIST, not against the raw string. A substring test
+        # passes for the wrong reason here: "accept" is a substring of
+        # "x-proxy-accept-language", so deleting "Accept" from the advertised list
+        # left the suite green, and so did deleting "Accept-Language". Both of
+        # those were measured. A browser compares whole header names, so the
+        # assertion now does too.
+        advertised = [h.strip().lower() for h in
+                      (hd.get("access-control-allow-headers") or "").split(",")]
         for hname in ("authorization", "content-type", "accept",
                       "accept-language", "user-agent", "x-proxy-key",
                       "x-proxy-accept-language", "x-proxy-forward-cookies",
                       "x-proxy-engine", "x-proxy-persona", "x-proxy-timeout-ms"):
             r.check("cors: allow-headers includes %s" % hname,
-                    hname in allowed, "value=%r" % hd.get("access-control-allow-headers"))
+                    hname in advertised,
+                    "advertised=%r" % advertised)
         r.check("cors: max-age is advertised",
                 (hd.get("access-control-max-age") or "") == "86400",
                 "value=%r" % hd.get("access-control-max-age"))
         # The header set the proxy actually READS, pinned against the advertised
         # list. This is the row that would have caught X-Proxy-Engine,
         # X-Proxy-Persona and X-Proxy-Timeout-Ms all being absent.
+        #
+        # The scan covers every read of a request header, not just
+        # `.headers.get(...)`: `incoming` IS a Headers object, so `incoming.get()`
+        # and `incoming.has()` are reads too. An earlier version matched only
+        # `request.headers.get` and `incoming.headers.get`, which cannot occur for
+        # `incoming`, so it missed `x-proxy-accept-language` and `x-proxy-persona`
+        # and reported a complete list while checking four of six.
         with open(V2) as fh:
             src = fh.read()
         read = set()
-        for m in re.finditer(r'(?:request|incoming)\.headers\.get\("([^"]+)"\)', src):
+        for m in re.finditer(
+                r'(?:request|incoming)(?:\.headers)?\.(?:get|has)\("([^"]+)"\)', src):
             read.add(m.group(1).lower())
         read.discard("__cfg")
         missing = sorted(n for n in read
-                         if n.startswith("x-proxy") and n not in allowed)
+                         if n.startswith("x-proxy") and n not in advertised)
         r.check("cors: every X-Proxy-* header the worker reads is advertised",
-                missing == [], "read but not advertised: %r" % missing)
+                missing == [] and len(read) >= 6,
+                "read=%s not advertised=%r" % (sorted(read), missing))
         # The proxy never advertises credentialed CORS, because it reflects
         # Origin against an open target list. A future edit adding ACAC here would
         # turn any site into a reader of a user's authenticated responses.
         r.check("cors: credentials are NOT enabled on a reflected origin",
                 hd.get("access-control-allow-credentials") is None,
                 "value=%r" % hd.get("access-control-allow-credentials"))
+    return r
+
+
+def probe_remaining_gaps():
+    """The branches a mutation sweep found unpinned, each now pinned.
+
+    A coverage sweep ran ~150 single-invariance mutations against v2 and recorded
+    every one that left the suite green. Sixteen survived. Several were equivalent
+    mutants rather than coverage gaps, and the sweep separated the two; this
+    section covers the behavioural ones, which are the ones a passing suite was
+    silently permitting.
+
+    Each row below corresponds to a mutation that previously survived, and
+    mutation_check.py now carries the mutation as well, so the two cannot drift.
+    """
+    print("\n=== M. previously unpinned branches, now pinned ===")
+    r = Results()
+    with Rig(V2, "gaps") as rig:
+        # --- SSRF guard boundaries that no test sat on ---
+        # 0.0.0.0/8 apart from the literal, and the top of the v4 space.
+        for label, target in (
+            ("0.1.2.3 inside 0/8", "https://0.1.2.3/x"),
+            ("224.0.0.1 multicast", "https://224.0.0.1/x"),
+            ("239.255.255.250", "https://239.255.255.250/x"),
+        ):
+            st, _, _ = rig.get("/" + target)
+            r.check("gaps: SSRF guard blocks %s" % label, st == 403,
+                    "target=%r status=%s" % (target, st))
+        # CONTROL: the first public address above a >= 224 boundary. If this were
+        # blocked too the rule would be over-broad rather than wrong.
+        st, _, _ = rig.get("/https://223.255.255.255/x")
+        r.check("CONTROL: 223.255.255.255, just below a >= 224, is allowed",
+                st == 200, "status=%s" % st)
+
+        # The BLOCKED_HOSTS literals. The blocklist is a Set and the suffix rule
+        # does not cover these, so each entry needs its own assertion or the whole
+        # literal can be deleted.
+        for host in ("metadata.google.internal", "metadata.goog",
+                     "instance-data.ec2.internal"):
+            st, _, _ = rig.get("/https://%s/computeMetadata/v1/" % host)
+            r.check("gaps: the literal %s is blocked" % host, st == 403,
+                    "status=%s" % st)
+        st, _, _ = rig.get("/https://foo.localhost/x")
+        r.check("gaps: any *.localhost name is blocked by the suffix rule",
+                st == 403, "status=%s" % st)
+        st, _, _ = rig.get("/https://notlocalhost.example.com/x")
+        r.check("CONTROL: a name merely containing 'localhost' is allowed",
+                st == 200, "status=%s" % st)
+
+        # --- cf-* response headers reaching the client ---
+        st, hd, _ = rig.get("/https://origin.test/__ctl/hdrs")
+        r.check("gaps: an upstream cf-ray is not passed to the client",
+                hd.get("cf-ray") is None, "cf-ray=%r" % hd.get("cf-ray"))
+        r.check("gaps: an upstream cdn-loop is not passed to the client",
+                hd.get("cdn-loop") is None, "cdn-loop=%r" % hd.get("cdn-loop"))
+        r.check("CONTROL: a non-cf header from the same response IS passed",
+                hd.get("x-keep-me") == "kept", "x-keep-me=%r" % hd.get("x-keep-me"))
+
+        # --- the default Accept and Accept-Language ---
+        st, _, body = rig.get("/https://origin.test/defaults")
+        h = (rig.seen(body) or {}).get("headers") or {}
+        r.check("gaps: a caller with no Accept gets the browser default",
+                "text/html" in h.get("accept", ""), "accept=%r" % h.get("accept"))
+        r.check("gaps: a caller with no Accept-Language gets the default",
+                h.get("accept-language") == "en-US,en;q=0.9",
+                "accept-language=%r" % h.get("accept-language"))
+        # The caller-supplied values win, which is the other half: without this a
+        # mutation that always overwrote would satisfy the two rows above.
+        st, _, body = rig.get("/https://origin.test/defaults",
+                              headers={"Accept": "application/json",
+                                       "Accept-Language": "fr-FR"})
+        h = (rig.seen(body) or {}).get("headers") or {}
+        r.check("CONTROL: a caller-supplied Accept is passed through",
+                h.get("accept") == "application/json", "accept=%r" % h.get("accept"))
+        r.check("CONTROL: a caller-supplied Accept-Language is passed through",
+                h.get("accept-language") == "fr-FR",
+                "accept-language=%r" % h.get("accept-language"))
+        # X-Proxy-Accept-Language is the documented override, and until now it was
+        # only ever tested for being STRIPPED, never for having any effect.
+        st, _, body = rig.get("/https://origin.test/lang",
+                              headers={"X-Proxy-Accept-Language": "de-DE,de;q=0.9"})
+        h = (rig.seen(body) or {}).get("headers") or {}
+        r.check("gaps: X-Proxy-Accept-Language actually sets the upstream language",
+                h.get("accept-language") == "de-DE,de;q=0.9",
+                "accept-language=%r" % h.get("accept-language"))
+        r.check("gaps: the override header itself is not forwarded upstream",
+                "x-proxy-accept-language" not in h, "hdrs=%s" % sorted(h))
+
+        # --- percent-decoding: a malformed escape must be a 400, not a 500 ---
+        # A malformed escape in a target that is ENTIRELY a bare path must be a
+        # 400, not the 500 a thrown decode produces. The decode is wrapped in
+        # try/catch, and an earlier version of this section asserted a 400 for
+        # "/https://origin.test/%zz", which is not a bare path: the escape there
+        # sits inside a URL that parses fine, so passing it through with 200 is
+        # correct. Only the bare-path form reaches the decode.
+        st, _, _ = rig.get("/%zz")
+        r.check("gaps: a malformed percent-escape in a bare path is a 400, not a 500",
+                st == 400, "status=%s" % st)
+        st, _, body = rig.get("/%25%25%25")
+        r.check("gaps: a target that decodes to nonsense is refused, not repaired",
+                st == 400, "status=%s" % st)
+        # CONTROL: a well-formed bare path IS decoded, so the rows above are not
+        # just "anything unparseable is refused".
+        st, _, body = rig.get("/origin.test/a%20b")
+        seen = rig.seen(body) or {}
+        r.check("CONTROL: a well-formed bare-path %20 is decoded before fetching",
+                st == 200 and "a%20b" in (seen.get("url") or ""),
+                "upstream=%r status=%s" % (seen.get("url"), st))
+        # An encoded separator decodes to a real path separator, which is the
+        # documented behaviour change in section 6.2.
+        st, _, body = rig.get("/origin.test/a%2Fb")
+        seen = rig.seen(body) or {}
+        r.check("gaps: an encoded slash decodes to a real separator",
+                (seen.get("url") or "").endswith("/a/b"),
+                "upstream=%r" % seen.get("url"))
+
+        # --- Referer is only rewritten when the caller sent one ---
+        st, _, body = rig.get("/https://origin.test/noref")
+        h = (rig.seen(body) or {}).get("headers") or {}
+        r.check("gaps: no Referer is invented when the caller sent none",
+                "referer" not in h, "referer=%r" % h.get("referer"))
+        st, _, body = rig.get("/https://origin.test/withref",
+                              headers={"Referer": "https://private.app/page"})
+        h = (rig.seen(body) or {}).get("headers") or {}
+        r.check("gaps: a caller Referer is rewritten to the target origin",
+                h.get("referer") == "https://origin.test/",
+                "referer=%r" % h.get("referer"))
+
+        # --- statuses that must not carry a body ---
+        for code in (204, 205):
+            st, hd, body = rig.get("/https://origin.test/__ctl/status?code=%d" % code)
+            r.check("gaps: a %d carries no body" % code, body == "",
+                    "body=%r" % body[:40])
+        st, hd, body = rig.get("/https://origin.test/__ctl/status?code=204",
+                               method="HEAD")
+        r.check("gaps: a HEAD carries no body", body == "", "body=%r" % body[:40])
+
+        # --- the /__config report ---
+        st, hd, body = rig.get("/__config")
+        c = json.loads(body or "{}")
+        r.check("gaps: /__config reports the proxy version",
+                c.get("version") is not None, "version=%r" % c.get("version"))
+        r.check("gaps: /__config reports the timeout floor and ceiling",
+                isinstance(c.get("min_timeout_ms"), int)
+                and isinstance(c.get("max_timeout_ms"), int),
+                "min=%r max=%r" % (c.get("min_timeout_ms"), c.get("max_timeout_ms")))
+        r.check("gaps: /__config reports the redirect cap",
+                c.get("max_redirects") == 5, "max_redirects=%r" % c.get("max_redirects"))
+        r.check("gaps: /__config names the personas",
+                c.get("personas") == ["edge", "chrome (requires engine=tls)", "pass"],
+                "personas=%r" % c.get("personas"))
+        r.check("gaps: /__config reports the default User-Agent",
+                c.get("default_user_agent") == "Cloudflare-Workers",
+                "value=%r" % c.get("default_user_agent"))
+        r.check("gaps: /__config states the timeout scope",
+                "header" in (c.get("timeout_scope") or "").lower(),
+                "value=%r" % c.get("timeout_scope"))
+
+        # Every error response is stamped with the version, so a client can tell
+        # which build answered even when the body is a failure.
+        st, hd, _ = rig.get("/?url=ftp%3A%2F%2Fx.test")
+        r.check("gaps: an error response carries x-proxy-version",
+                hd.get("x-proxy-version") is not None,
+                "value=%r" % hd.get("x-proxy-version"))
+        st, hd, _ = rig.get("/https://origin.test/ok")
+        r.check("CONTROL: a success response carries x-proxy-version too",
+                hd.get("x-proxy-version") is not None,
+                "value=%r" % hd.get("x-proxy-version"))
+    return r
+
+
+def probe_origin_scoped():
+    """Origin-scoped response headers must not be replayed onto this origin.
+
+    A response served from the proxy's origin carries the proxy's security
+    posture. Copying an upstream's Content-Security-Policy, HSTS,
+    X-Frame-Options, Permissions-Policy or COOP onto it applies the upstream's
+    policy to pages the proxy serves, which is never what either party meant.
+
+    Clear-Site-Data is the sharp one. RFC 9535 s4 scopes it to the origin it
+    arrived on, so a third-party upstream can arm it against the proxy's own
+    origin. No authentication is needed, because the shipped default is an open
+    proxy.
+    """
+    print("\n=== N. origin-scoped response headers ===")
+    r = Results()
+    with Rig(V2, "origscoped") as rig:
+        st, hd, _ = rig.get("/https://origin.test/__ctl/originscoped")
+        for name in ("clear-site-data", "content-security-policy",
+                     "strict-transport-security", "x-frame-options",
+                     "cross-origin-opener-policy", "cross-origin-embedder-policy",
+                     "permissions-policy", "report-to"):
+            r.check("origscoped: an upstream %s does not reach the client" % name,
+                    hd.get(name) is None, "%s=%r" % (name, hd.get(name)))
+        # CONTROL: the drop is a list, not "strip everything". An ordinary header
+        # from the same response must still arrive, or the fix would be "throw
+        # away the origin's response headers".
+        r.check("CONTROL: an ordinary upstream header still reaches the client",
+                hd.get("x-ordinary-header") == "kept",
+                "value=%r" % hd.get("x-ordinary-header"))
+
+        # A Location whose scheme is not http(s). rewriteLocation's own comment
+        # says the point is that the client must never leave the proxy, and
+        # returning the value verbatim does exactly that.
+        for loc in ("ftp://attacker.test/x", "javascript:alert(1)",
+                    "data:text/html,<script>alert(1)</script>"):
+            from urllib.parse import quote
+            st, hd, _ = rig.get("/https://origin.test/__ctl/oddscheme?to="
+                                + quote(loc, safe=""))
+            got = hd.get("location")
+            r.check("origscoped: a non-http(s) Location is not handed to the client",
+                    got is None or not got.startswith(("ftp:", "javascript:", "data:")),
+                    "location=%r" % got)
+        # CONTROL: an https Location IS rewritten, so the row above is about the
+        # scheme and not about Location handling in general.
+        from urllib.parse import quote
+        st, hd, _ = rig.get("/https://origin.test/__ctl/oddscheme?s=201&to="
+                            + quote("https://thirdparty.test/x", safe=""))
+        r.check("CONTROL: an https Location IS rewritten into proxy space",
+                (hd.get("location") or "").startswith("http://proxy.local/"),
+                "location=%r" % hd.get("location"))
+    return r
+
+
+def probe_security_round4():
+    """The seven findings from the security lens, each pinned.
+
+    Every one of these was reproduced first with a standalone probe against the
+    real runtime, then fixed, then pinned here. The comment on each records the
+    measurement that found it, because the reason the assertion exists is the
+    part that does not survive into a future diff.
+    """
+    print("\n=== O. security lens, round 4 ===")
+    r = Results()
+    with Rig(V2, "sec4") as rig:
+        # 1. A NUL byte makes new URL() throw, and the bare-host fallback then
+        # turns a rejected scheme into a request for a different host. Measured:
+        # "/ftp%3A%2F%2Fevil.test%00/x" was accepted before the guard existed.
+        #
+        # The assertion has to distinguish this guard from the bare-host guard
+        # below, because the two overlap: with the NUL check removed, this target
+        # is still refused with a 400 by the bare-host path, so the row passed
+        # against a mutant that deleted the thing it names. Both guards are real
+        # and neither is redundant, because the bare-host guard rejects on SHAPE
+        # and this one rejects on CHARACTER before any parse is attempted, so it
+        # also covers a target that would otherwise parse.
+        st, _, _ = rig.get("/ftp%3A%2F%2Fevil.test%00/x")
+        r.check("sec4: a target containing a NUL byte is refused with 400",
+                st == 400, "status=%s" % st)
+        # A NUL inside a target that WOULD otherwise be a valid bare host, so the
+        # bare-host shape check cannot be what refuses it.
+        st, _, body = rig.get("/origin.test/%00path")
+        r.check("sec4: a NUL inside an otherwise-valid target is refused",
+                st == 400 and "Invalid target URL" in (body or ""),
+                "status=%s body=%r" % (st, (body or "")[:60]))
+        # The bare-host shape guard, tested on its own: no control character, but
+        # not an authority either.
+        st, _, body = rig.get("/https://x%5Ey.test/")
+        r.check("sec4: a target with no bare-authority shape is refused",
+                st == 400 and "Invalid target URL" in (body or ""),
+                "status=%s body=%r" % (st, (body or "")[:60]))
+
+        # 2. A Location the proxy cannot express into proxy space is DROPPED.
+        # Returning it verbatim sent the client to ftp:, javascript: or data:,
+        # which no policy in this file evaluated.
+        from urllib.parse import quote
+        # Asserted as ABSENT, not as "does not start with the scheme". With the
+        # protocol check removed, rewriteLocation falls through and the value is
+        # wrapped as proxy space: "http://proxy.local/ftp://attacker.test/x". That
+        # does not begin with "ftp:", so a scheme-prefix row passed against a
+        # mutant that had stopped doing the check. The header must not be there.
+        for loc in ("ftp://attacker.test/x", "javascript:alert(1)",
+                    "data:text/html,<script>alert(1)</script>"):
+            st, hd, _ = rig.get("/https://origin.test/__ctl/oddscheme?to="
+                                + quote(loc, safe=""))
+            r.check("sec4: a %s Location is DROPPED, not wrapped or forwarded"
+                    % loc.split(":")[0],
+                    hd.get("location") is None,
+                    "location=%r" % hd.get("location"))
+            r.check("sec4: the %s value does not appear anywhere in the Location"
+                    % loc.split(":")[0],
+                    loc not in (hd.get("location") or ""),
+                    "location=%r" % hd.get("location"))
+        st, hd, _ = rig.get("/https://origin.test/__ctl/oddscheme?to="
+                            + quote("https://thirdparty.test/x", safe=""))
+        r.check("CONTROL: an https Location IS still rewritten into proxy space",
+                (hd.get("location") or "").startswith("http://proxy.local/"),
+                "location=%r" % hd.get("location"))
+
+        # 3. Cookie consent covers the scheme as well as the host. Measured: a
+        # 302 Location: http://origin.test/after carried the cookie in cleartext
+        # from a caller who had named only https://origin.test.
+        # The FINAL hop is what matters, so the fixture redirects to a path that
+        # reports its own headers. rig.seen() returns the LAST hop's record for a
+        # redirect that completes, and hop 0 for one that does not, so the
+        # assertion reads the final hop's echo.
+        #
+        # An earlier version of this section pointed at /x rather than
+        # /__ctl/echo and read hop 0, so it was asserting about the FIRST request
+        # and passing for the wrong reason while the downgrade went unmeasured.
+        c = {"X-Proxy-Forward-Cookies": "1", "Cookie": "session=SECRET"}
+        st, _, body = rig.get(
+            "/https://origin.test/__ctl/crosshost?to=http%3A%2F%2Forigin.test%2F__ctl%2Fecho",
+            headers=c)
+        seen = rig.seen(body) or {}
+        r.check("sec4: the downgrade hop really was reached over http",
+                (seen.get("url") or "") == "http://origin.test/__ctl/echo",
+                "final hop url=%r" % seen.get("url"))
+        r.check("sec4: the cookie does not follow an https->http downgrade",
+                "cookie" not in (seen.get("headers") or {}),
+                "cookie=%r" % (seen.get("headers") or {}).get("cookie"))
+        st, _, body = rig.get(
+            "/https://origin.test/__ctl/crosshost?to=https%3A%2F%2Forigin.test%2F__ctl%2Fecho",
+            headers=c)
+        seen = rig.seen(body) or {}
+        r.check("CONTROL: the cookie DOES survive an https->https same-host hop",
+                (seen.get("headers") or {}).get("cookie") == "session=SECRET",
+                "final hop=%r cookie=%r" % (seen.get("url"),
+                                           (seen.get("headers") or {}).get("cookie")))
+
+        # 4. On a hop to a host the caller did not name, only the proxy's own
+        # headers cross. Measured: X-Forwarded-Authorization, X-Api-Key,
+        # X-Auth-Token, X-Tenant-Id and 33 further unnamed headers all arrived.
+        # __ctl/crosshost, not __ctl/goto: the harness TAP registers /__ctl/goto
+        # AFTER a catch-all /__ctl/redirect branch that matches first, so goto
+        # never emits its Location and every request to it stayed on hop 0. An
+        # earlier version of this section used goto and read hop 0's headers,
+        # which is exactly the request that SHOULD carry the header, so the
+        # assertions passed while the cross-host hop went unmeasured.
+        for name in ("X-Forwarded-Authorization", "X-Api-Key", "X-Auth-Token",
+                     "X-Tenant-Id", "X-Custom-Thing"):
+            st, _, body = rig.get(
+                "/https://origin.test/__ctl/crosshost?to=https%3A%2F%2Fother.test%2F__ctl%2Fecho",
+                headers={name: "CANARY"})
+            seen = rig.seen(body) or {}
+            r.check("sec4: %s does not cross to a redirect target" % name,
+                    (seen.get("headers") or {}).get(name.lower()) is None,
+                    "forwarded=%r" % (seen.get("headers") or {}).get(name.lower()))
+        st, _, body = rig.get("/https://origin.test/firsthop",
+                              headers={"X-Custom-Thing": "CANARY"})
+        seen = rig.seen(body) or {}
+        r.check("CONTROL: the caller's own headers DO reach the host it named",
+                (seen.get("headers") or {}).get("x-custom-thing") == "CANARY",
+                "forwarded=%r" % (seen.get("headers") or {}).get("x-custom-thing"))
+
+        # 5. RFC 9110 s7.6.1: a proxy must remove the fields Connection NAMES.
+        # Measured: `Connection: X-Secret` forwarded X-Secret upstream.
+        st, _, body = rig.get("/https://origin.test/nomin",
+                              headers={"Connection": "X-Secret",
+                                       "X-Secret": "Nominated"})
+        seen = rig.seen(body) or {}
+        r.check("sec4: a header named by Connection is not forwarded (RFC 9110 s7.6.1)",
+                (seen.get("headers") or {}).get("x-secret") is None,
+                "forwarded=%r" % (seen.get("headers") or {}).get("x-secret"))
+        st, _, body = rig.get("/https://origin.test/nomin2",
+                              headers={"Connection": "X-A, X-B",
+                                       "X-A": "1", "X-B": "2"})
+        seen = rig.seen(body) or {}
+        h = seen.get("headers") or {}
+        r.check("sec4: every name in a multi-token Connection list is removed",
+                "x-a" not in h and "x-b" not in h,
+                "x-a=%r x-b=%r" % (h.get("x-a"), h.get("x-b")))
+        st, _, body = rig.get("/https://origin.test/nomin3",
+                              headers={"X-Secret": "Nominated"})
+        seen = rig.seen(body) or {}
+        r.check("CONTROL: the same header IS forwarded when nothing nominates it",
+                (seen.get("headers") or {}).get("x-secret") == "Nominated",
+                "forwarded=%r" % (seen.get("headers") or {}).get("x-secret"))
+
+        # 6. The bare-host fallback runs only on something that looks like a bare
+        # authority. Measured: "https://[fe80::1%25eth0]/" fetched
+        # https://https//[fe80::1%eth0]/ because prepending a scheme to a target
+        # that already has one collapses it.
+        for target in ("https://[fe80::1%25eth0]/", "https://x%5Ey.test/",
+                       "https://a%7Cb.test/"):
+            st, _, body = rig.get("/" + target)
+            # A refused target returns a JSON error and never fetches, so the
+            # absence of a TAP record is part of what is being asserted: the
+            # original defect was a 200 carrying a record for a host nobody named.
+            r.check("sec4: %s is refused, not repaired" % target,
+                    st == 400 and rig.seen(body) is None
+                    and "Invalid target URL" in (body or ""),
+                    "status=%s body=%r" % (st, (body or "")[:60]))
+        # CONTROL: a genuine bare host still works, so the rule is not "refuse
+        # anything without a scheme".
+        st, _, body = rig.get("/origin.test/plain")
+        seen = rig.seen(body) or {}
+        r.check("CONTROL: a bare host is still accepted and fetched over https",
+                st == 200 and seen.get("url") == "https://origin.test/plain",
+                "upstream=%r status=%s" % (seen.get("url"), st))
+
+        # 7. A non-string ALLOWED_HOSTS is a misconfiguration, and the previous
+        # behaviour fell back to the module constant, which is []: the open-proxy
+        # default. Measured with an array, a number and a boolean, all three
+        # returned 200 for a host a correctly-set string refused with 403.
+        import tempfile
+        for label, val in (("array", "['origin.test']"), ("number", "42"),
+                           ("boolean", "true")):
+            with open(V2) as fh:
+                src = fh.read()
+            src = src.replace(
+                "async fetch(request, env) {",
+                "async fetch(request, env) {\n\t\tenv = Object.assign("
+                "{ ALLOWED_HOSTS: %s }, env || {});" % val, 1)
+            d = tempfile.mkdtemp(prefix="v2-badhost-")
+            p2 = os.path.join(d, "worker.js")
+            with open(p2, "w") as fh:
+                fh.write(src)
+            try:
+                with Rig(p2, "badhost-" + label) as rig2:
+                    st, hd, _ = rig2.get("/https://notlisted.test/x")
+                    r.check("sec4: a %s ALLOWED_HOSTS binding is refused, not opened"
+                            % label,
+                            st == 500 and "ALLOWED_HOSTS" in (hd.get("x-proxy-version") or "") + json.dumps(hd) or st == 500,
+                            "status=%s" % st)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+        # CONTROL: the documented empty string still means "no allowlist", which is
+        # a choice with a name. If the refusal above were really "refuse anything
+        # that is not a non-empty string", this would be a 500 and the shipped
+        # default would be unusable.
+        st, _, body = rig.get("/__config")
+        r.check("CONTROL: an unset ALLOWED_HOSTS still reports the open default",
+                st == 200 and json.loads(body).get("allowed_hosts") == [],
+                "status=%s" % st)
     return r
 
 
@@ -1685,6 +2169,9 @@ def main():
     edges = probe_response_edges()
     cover = probe_header_coverage()
     cors = probe_cors_static()
+    gaps = probe_remaining_gaps()
+    orig = probe_origin_scoped()
+    sec4 = probe_security_round4()
 
     # Every control row in the suite, wherever it lives. A control row asserts
     # that a KNOWN defect or a KNOWN branch-selector IS present, so it is valid
@@ -1699,6 +2186,9 @@ def main():
         + [row for row in edges.rows if row[0].startswith("CONTROL")]
         + [row for row in cover.rows if row[0].startswith("CONTROL")]
         + [row for row in cors.rows if row[0].startswith("CONTROL")]
+        + [row for row in gaps.rows if row[0].startswith("CONTROL")]
+        + [row for row in orig.rows if row[0].startswith("CONTROL")]
+        + [row for row in sec4.rows if row[0].startswith("CONTROL")]
     )
     controls_ok = bool(controls) and all(row[1] for row in controls)
 
@@ -1716,6 +2206,23 @@ def main():
         print("           The harness is not measuring what it claims, so the v2")
         print("           results below prove nothing.")
 
+    # The v1 baseline rows are OBSERVATIONS about the old worker, and they must gate
+    # the run like every other section.
+    #
+    # They did not, and that was the worst failure mode available to this suite: a
+    # v1 row could print FAIL, the three NEG-CONTROLs still fired, and main() would
+    # print "VALID" and exit 0. A red row in a green report is worse than a
+    # missing row, because it reads as a known-and-accepted failure.
+    #
+    # Reproduced before fixing: changing v1's hardcoded User-Agent from
+    # "Safari/605.1.15" to "Chrome/999.0.0.0" in a copy of the tree produced
+    #
+    #   FAIL  v1: rewrites a curl UA to a fixed Safari 18.5 string
+    #   VALID: all 14 control assertions fired.
+    #   OVERALL: PASS
+    #
+    # with exit status 0. The suite now fails on it.
+    v1_ok = v1.summary("v1 baseline observations")
     v2_ok = v2.summary("v2")
     auth_ok = auth.summary("auth + allowlist")
     tls_ok = tls.summary("engine=tls + chrome persona")
@@ -1725,8 +2232,12 @@ def main():
     edges_ok = edges.summary("response header edges")
     cover_ok = cover.summary("header policy coverage")
     cors_ok = cors.summary("CORS preflight contract")
-    ok = (v2_ok and auth_ok and tls_ok and tlsb_ok and hosts_ok
-          and redir_ok and edges_ok and cover_ok and cors_ok and controls_ok)
+    gaps_ok = gaps.summary("previously unpinned branches")
+    orig_ok = orig.summary("origin-scoped response headers")
+    sec4_ok = sec4.summary("security lens, round 4")
+    ok = (v1_ok and v2_ok and auth_ok and tls_ok and tlsb_ok and hosts_ok
+          and redir_ok and edges_ok and cover_ok and cors_ok and gaps_ok
+          and orig_ok and sec4_ok and controls_ok)
     print("\nOVERALL: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

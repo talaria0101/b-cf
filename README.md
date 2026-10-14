@@ -45,9 +45,21 @@ Three values of `X-Proxy-Persona`:
 
 | value | what the destination sees | applies when |
 |---|---|---|
-| `edge` (default) | `User-Agent: Cloudflare-Workers`, no Client Hints | always |
+| `edge` (default) | `User-Agent: Cloudflare-Workers`, no Client Hints | the caller's own UA looks like a script or command-line client |
 | `chrome` | Chrome UA + low-entropy hints + `Upgrade-Insecure-Requests` | `X-Proxy-Engine: tls` **and** a bound transport |
 | `pass` | the caller's UA, verbatim | opt-in |
+
+The `edge` default is not unconditional, and the distinction matters. A caller
+arriving with a genuine browser User-Agent and no `X-Proxy-Persona` has its own UA
+**forwarded verbatim, Client Hints included**: a real browser's identity is
+coherent, so rewriting it would only make it less accurate. The `edge` identity is
+what replaces a *scripted* client, because a script announcing itself honestly is
+what a proxy choosing to be identifiable is saying. Set `X-Proxy-Persona: pass` to
+make the no-rewrite behaviour explicit rather than incidental.
+
+Client Hints and `Upgrade-Insecure-Requests` from the `chrome` persona are emitted
+over `https` only. Both are secure-context features a real Chrome withholds on a
+plaintext target.
 
 The default is `edge` because v1 did the opposite. v1 announced Safari 18.5 on
 every request, over a handshake that `tls.peet.ws` reports as
@@ -94,8 +106,8 @@ this path. `GET /__config` reports this as `allowed_hosts_match`.
 ## Run the proofs
 
 ```bash
-python3 harness/test_proxy.py            # 313 assertion rows (14 controls), ~3s
-python3 harness/mutation_check.py        # 51 mutations, all must be caught, ~8s
+python3 harness/test_proxy.py            # 402 assertion rows (30 controls), ~3s
+python3 harness/mutation_check.py        # 58 mutations, all must be caught, ~30s
 python3 harness/probe_raw_socket.py      # the TLS-raw-stream measurement, ~0.3s
 ```
 
