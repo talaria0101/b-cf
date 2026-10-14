@@ -234,6 +234,32 @@ export default {
 			if (u.pathname === "/__ctl/hang") {
 				await new Promise(() => {});
 			}
+			// Slow BEFORE HEADERS, which is the case the deadline is for. The
+			// deadline is cleared once response headers resolve, so a peer that
+			// answers fast and then stalls is NOT bounded by it; a peer that takes
+			// its whole budget to send headers is. Keeping the two distinguishable
+			// is what makes the timeout_scope claim checkable rather than asserted.
+			if (u.pathname === "/__ctl/slowheaders") {
+				const secs = Number(u.searchParams.get("s") || "34");
+				await new Promise((res) => setTimeout(res, secs * 1000));
+				return new Response("late-headers", { status: 200 });
+			}
+			// Headers at once, body N seconds later. The inverse of the above.
+			if (u.pathname === "/__ctl/latebody") {
+				const stream = new ReadableStream({
+					start(c) {
+						c.enqueue(new TextEncoder().encode("headers-first\n"));
+						setTimeout(() => {
+							c.enqueue(new TextEncoder().encode("body-finished\n"));
+							c.close();
+						}, Number(u.searchParams.get("s") || "2") * 1000);
+					},
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { "content-type": "text/plain" },
+				});
+			}
 			// Slow BUT COMPLETING. Distinguishes workerd's hung-code detector
 			// (which fires on a peer that never answers) from the Worker's own
 			// AbortController, which must fire on a peer that is merely slow.

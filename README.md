@@ -106,7 +106,7 @@ this path. `GET /__config` reports this as `allowed_hosts_match`.
 ## Run the proofs
 
 ```bash
-python3 harness/test_proxy.py            # 402 assertion rows (30 controls), ~3s
+python3 harness/test_proxy.py            # 407 assertion rows (32 controls), ~3s
 python3 harness/mutation_check.py        # 58 mutations, all must be caught, ~30s
 python3 harness/probe_raw_socket.py      # the TLS-raw-stream measurement, ~0.3s
 ```
@@ -134,13 +134,16 @@ It also does not change the egress address, which is the layer that decides most
 bot-managed sites. Section 3.3 concerns the layer above that one.
 
 Section 6.2 lists the behaviour changes that will affect an existing v1 caller,
-including that cookies and `Authorization` are not forwarded by default.
+including that cookies and `Authorization` are not forwarded. Cookies can be
+opted back into per request; `Authorization` cannot, because forwarding it is how
+the proxy's own credential reached third-party origins, and there is no header a
+caller can send to re-enable it.
 
 ## Layout
 
 ```
 rig/v2.js             the worker: plain ES2022, no build step, no dependencies
-rig/v1-baseline.js    v1, reformatted, with a 3-line provenance header (RESEARCH.md 1)
+rig/v1-baseline.js    v1, reformatted, with an 11-line provenance header (RESEARCH.md 1)
 wrangler.toml         deploy config; pins the tested compatibility date
 LICENSE               0BSD
 harness/rig.py        runs a worker under real workerd with an in-process TAP origin

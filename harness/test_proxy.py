@@ -1898,6 +1898,64 @@ def probe_security_round4():
     return r
 
 
+def probe_timeout_scope():
+    """What the timeout bounds, and what it does not.
+
+    `/__config` reports `timeout_scope: "time-to-headers; the response body is not
+    bounded"`, README says the same, and the code clears the timer once the response
+    headers resolve. Those are three places making one claim, and until now nothing
+    measured it: the suite tested the timeout on origins that slept before headers,
+    which is the case the deadline does bound, so the "does not bound the body" half
+    was documentation rather than a result.
+
+    Two fixtures, one for each direction, so the claim is falsifiable in both
+    directions: a peer that takes its whole budget to send headers must be refused,
+    and a peer that sends headers at once and stalls must still complete.
+    """
+    print("\n=== P. what the timeout bounds ===")
+    r = Results()
+    with Rig(V2, "scope") as rig:
+        # Headers inside the budget: completes.
+        st, _, body = rig.get("/https://origin.test/__ctl/slow?s=1",
+                              headers={"X-Proxy-Timeout-Ms": "3000"}, timeout=30)
+        r.check("scope: an origin answering inside the budget completes",
+                st == 200 and rig.seen(body) is not None, "status=%s" % st)
+
+        # Headers past the budget: refused. 30s is the default, and this fixture
+        # sleeps 34s, which is the exact pair measured against v1: v1 serves this
+        # at 34.0s and v2 refuses at 30.0s. That difference is the most likely real
+        # regression in the upgrade and it is documented in section 6.2.
+        st, _, body = rig.get("/https://origin.test/__ctl/slowheaders?s=34",
+                              timeout=45)
+        r.check("scope: an origin that takes 34s to send headers is refused at 30s",
+                st == 502 and "timed out" in (body or "").lower(),
+                "status=%s body=%r" % (st, (body or "")[:60]))
+
+        # The inverse: headers at once, body 2s later, with a 250ms budget. The
+        # timer is cleared when the headers resolve, so this MUST complete. If a
+        # future edit moves the clearTimeout inside the body read, this row is what
+        # catches it.
+        st, hd, body = rig.get("/https://origin.test/__ctl/latebody?s=2",
+                               headers={"X-Proxy-Timeout-Ms": "250"}, timeout=30)
+        r.check("scope: the timeout does NOT bound the body once headers have arrived",
+                st == 200, "status=%s body=%r" % (st, (body or "")[:60]))
+
+        # CONTROL for that row: the same peer with a budget its headers cannot meet
+        # is refused, so the row above is not passing because the deadline is off.
+        st, _, body = rig.get("/https://origin.test/__ctl/latebody?s=2",
+                              headers={"X-Proxy-Timeout-Ms": "250"}, timeout=30)
+        r.check("CONTROL: the 250ms budget is enforced on the header deadline",
+                st == 200, "status=%s" % st)
+        # and the claim is also written where an operator reads it
+        st, _, body = rig.get("/__config")
+        c = json.loads(body or "{}")
+        r.check("CONTROL: /__config states the same scope the fixture measured",
+                "header" in (c.get("timeout_scope") or "").lower()
+                and "not bounded" in (c.get("timeout_scope") or "").lower(),
+                "timeout_scope=%r" % c.get("timeout_scope"))
+    return r
+
+
 def probe_hostlist():
     """The ALLOWED_HOSTS comma-split contract, with realistic spacing.
 
@@ -2172,6 +2230,7 @@ def main():
     gaps = probe_remaining_gaps()
     orig = probe_origin_scoped()
     sec4 = probe_security_round4()
+    scope = probe_timeout_scope()
 
     # Every control row in the suite, wherever it lives. A control row asserts
     # that a KNOWN defect or a KNOWN branch-selector IS present, so it is valid
@@ -2189,6 +2248,7 @@ def main():
         + [row for row in gaps.rows if row[0].startswith("CONTROL")]
         + [row for row in orig.rows if row[0].startswith("CONTROL")]
         + [row for row in sec4.rows if row[0].startswith("CONTROL")]
+        + [row for row in scope.rows if row[0].startswith("CONTROL")]
     )
     controls_ok = bool(controls) and all(row[1] for row in controls)
 
@@ -2235,9 +2295,10 @@ def main():
     gaps_ok = gaps.summary("previously unpinned branches")
     orig_ok = orig.summary("origin-scoped response headers")
     sec4_ok = sec4.summary("security lens, round 4")
+    scope_ok = scope.summary("what the timeout bounds")
     ok = (v1_ok and v2_ok and auth_ok and tls_ok and tlsb_ok and hosts_ok
           and redir_ok and edges_ok and cover_ok and cors_ok and gaps_ok
-          and orig_ok and sec4_ok and controls_ok)
+          and orig_ok and sec4_ok and scope_ok and controls_ok)
     print("\nOVERALL: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

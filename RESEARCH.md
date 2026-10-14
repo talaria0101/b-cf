@@ -36,9 +36,9 @@ rather than smoothed over.
    (100,000/day), **$5.00/month** on Paid, and **$45.40** at 100M requests/month.
    Adding Browser Run is **+$0.09 per browser-hour**, which is the number that
    decides everything. Section [7](#7-pricing).
-6. **The proofs are executable**: 172 assertion rows against v2 under Cloudflare's
-   own `workerd`, 5 control assertions that fire on known defects, and a mutation
-   check that breaks 40 invariants and requires the suite to catch every one. All
+6. **The proofs are executable**: 402 assertion rows against v2 under Cloudflare's
+   own `workerd`, 32 control assertions that fire on known defects, and a mutation
+   check that breaks 58 invariants and requires the suite to catch every one. All
    green.
 
 ---
@@ -47,10 +47,10 @@ rather than smoothed over.
 
 The upstream file is 101 lines, 3423 bytes,
 `sha256 3e06a02a0c466b704a1d550167c346102ba2734587e85a68efd1d3d15ef0f6fa` (verified
-by download on 2026-10-13). `rig/v1-baseline.js` in this repo is a **3-line
+by download on 2026-10-13). `rig/v1-baseline.js` in this repo is an **11-line
 provenance header plus upstream's code reformatted**: indentation widened from 2
-spaces to 4, trailing whitespace stripped, final newline dropped. It is 103 lines
-and 3799 bytes, so **its** hash differs from the value above, and it is **not**
+spaces to 4, trailing whitespace stripped, final newline dropped. It is 111 lines
+and 4330 bytes, so **its** hash differs from the value above, and it is **not**
 byte-for-byte. An earlier revision of this document and of the file's own header
 claimed it was; both were wrong and are corrected here. Whitespace is not semantic
 in JavaScript, so the negative control still exercises exactly the code upstream
@@ -353,7 +353,8 @@ Prior art for the transport, which is the part that would actually be adopted
 rather than written: `latentharbor/tunnelfetch` ships TLS 1.2/1.3 and HTTP/2 in
 userland ESM with no `node:` imports, and `EithonX/socksflare` ships rustls
 compiled to WASM. v2 does not vendor either. `rig/v2.js` defines the binding
-contract (`TLS_TRANSPORT.fetch(url, {headers})`) and tests it against a stub, which
+contract (`TLS_TRANSPORT.fetch(url, { method, headers, body, signal })`) and tests it
+against a stub, which
 is what a seam is for; a hand-written TLS stack behind an unmeasured claim would be a
 worse thing to ship than an honest default.
 
@@ -568,7 +569,7 @@ Every row is an assertion in `harness/test_proxy.py`, run under real `workerd`.
 | Default persona is honest | `v2: does NOT claim Chrome by default`; `v2: sends no sec-ch-ua on the honest persona` |
 | Bot-tool UA replaced on the default persona | 7 tool UAs, incl. `curl`, `python-requests`, `Go-http-client`, `okhttp`, `scrapy` |
 | `persona=pass` verbatim | the caller's UA is forwarded untouched |
-| Chrome persona needs a TLS transport | `persona=chrome is refused without a TLS transport, not silently downgraded` |
+| Chrome persona needs a TLS transport | `persona=chrome` **without** `engine=tls` does not claim Chrome; the request proceeds on the `fetch()` engine and the caller's UA is rewritten to `Cloudflare-Workers`, so the origin sees an honest identity rather than a browser claim the handshake cannot support. Measured: 200 with `User-Agent: Cloudflare-Workers`. Asking for `engine=tls` with nothing bound **is** a 501, so the engine itself is never silently downgraded. The persona is dropped, the engine is not. |
 | `engine=tls` without a transport is 501 | `engine=tls without a bound transport returns 501, not a silent fallback`, and the body names `TLS_TRANSPORT` |
 | Transport branch actually routes | `tls: engine=tls routes the request to the bound transport`, plus a control that a bound transport is **not** used on `engine=fetch` |
 | Chrome persona is internally coherent | `sec-ch-ua` major == UA major; `sec-ch-ua-platform` == the UA's OS |
@@ -584,12 +585,12 @@ Every row is an assertion in `harness/test_proxy.py`, run under real `workerd`.
 | Policy re-applied per hop | allowlist + SSRF guard run on every hop, so a redirect cannot escape |
 | Redirect cap pinned | 3-hop chain completes, 12-hop chain refused with 508, relative `Location` resolves |
 | Per-request timeout | `X-Proxy-Timeout-Ms`, clamped to [250, 60000], resolved value observable at `/__config` |
-| Auth + allowlist | 16 assertions: 401/403 paths, case-insensitive scheme, subdomain vs lookalike |
+| Auth + allowlist | 17 assertions: 401/403 paths, case-insensitive scheme, subdomain vs lookalike |
 
-Totals across the suite: **120** in section C plus **1** CONTROL row, **10** auth and **7**
-allowlist (D), **16** engine/persona plus **1** CONTROL row (E), **8** hostlist
-(F), **6** v1 observations, plus the **3 NEG-CONTROL** rows. That is 172 rows,
-of which **5** are controls.
+Totals across the suite are in section 8.1. An earlier revision of this paragraph
+carried a stale breakdown (172 rows, 5 controls) that had not been updated as
+sections were added; section 8.1 is the single place the counts live, so a
+reader counting rows from the run output lands in one number rather than three.
 
 ### 6.2 Behaviour changes that will break an existing v1 caller
 
@@ -611,6 +612,11 @@ than one that fails loudly.
 | `Accept` always sent | v1 sent none when the caller sent none, so a raw API client now receives the browser default unless it sets `Accept` explicitly. |
 | Timeout is per hop | Worst case `(MAX_REDIRECTS+1) x MAX_TIMEOUT_MS`. |
 | `cf-*` response headers dropped | v1 passed them through. Harmless; they are edge artefacts. |
+| **A 30 s default upstream deadline** | v1 set no deadline at all. A v1 caller proxying an origin that takes 34 s to send headers got a 200; under v2 the same request is **502 "Upstream request timed out"** at 30 s. This is the regression most likely to be met in practice, because slow origins are ordinary. Raise it per request with `X-Proxy-Timeout-Ms` up to 60000. |
+| `Accept-Language` is always sent | v1 sent none unless the caller did. v2 defaults it to `en-US,en;q=0.9`, so an origin doing content negotiation sees a language the caller never expressed. Set it per request with `X-Proxy-Accept-Language`. |
+| `Host` is not forwarded | v1 forwarded the caller's `Host`, which is wrong: it handed the proxy's own name, or whatever the caller set, to a third-party origin. v2 sends none and lets the runtime derive it from the URL. |
+| Hop-by-hop headers are not forwarded | `Connection`, `Keep-Alive`, `TE`, `Trailer`, `Upgrade` and `Proxy-Authenticate` no longer reach the destination. RFC 9110 s7.6.1 forbids forwarding them, and v1 forwarded all of them. |
+| `X-Forwarded-Proto` is not forwarded | Listed in v1's removal set already for `X-Forwarded-For` and `X-Real-IP`; v2 adds it, and a caller that set it deliberately no longer passes it through. |
 | Cookie consent is scoped to one host | `X-Proxy-Forward-Cookies: 1` forwards the cookie to the host the request names. A redirect to a different host does not inherit the consent. A v1 caller that relied on cookies surviving a cross-host redirect sees the target without them. |
 | `engine=tls` refuses a bodied request without `supportsBody` | A `POST` with `X-Proxy-Engine: tls` and a transport that has not declared `supportsBody = true` gets a **501**, not a bodiless request. Before the transport contract was tightened, an earlier build passed no method or body at all, so the destination received an empty `POST` and answered 200. |
 | The timeout bounds headers, not the body | `X-Proxy-Timeout-Ms` is cleared once response headers arrive. A destination that sends headers at once and stalls afterwards still completes. Aborting mid-stream would truncate a response already in progress, and there is no way to signal truncation through a streaming body. |
@@ -881,17 +887,18 @@ from arithmetic into a measurement.
 
 ```
 rig/v2.js             the worker (plain JS, no build)
-rig/v1-baseline.js    v1, reformatted, with a 3-line provenance header (see 1)
+rig/v1-baseline.js    v1, reformatted, with an 11-line provenance header (see 1)
 wrangler.toml         deploy config
 LICENSE               0BSD
 harness/rig.py        runs a worker under real workerd, with an in-process TAP origin
-harness/test_proxy.py  402 assertion rows in 13 sections, of which 30 are controls:
+harness/test_proxy.py  407 assertion rows in 14 sections, of which 32 are controls:
                       152 v2 (C), 17 auth+allowlist (D), 21 engine/persona (E),
                       8 engine/body (F), 12 hostlist (G), 11 redirect scoping (H),
                       4 response edges (J), 67 header coverage (K), 23 CORS (L),
                       35 previously-unpinned branches (M), 13 origin-scoped
                       response headers (N), 30 security round 4 (O),
-                      9 v1 observation (A/B), of which 3 NEG-CONTROL and 27 CONTROL
+                      5 what the timeout bounds (P),
+                      9 v1 observation (A/B), of which 3 NEG-CONTROL and 29 CONTROL
 harness/mutation_check.py  58 mutations, each required to be caught
 harness/probe_raw_socket.py  the Layer 1 measurement: is connect() a raw stream?
 harness/probe_*.py    the five probes: four behind the timeout findings, plus
@@ -906,8 +913,8 @@ bin/wd                workerd 2026-10-13 (Cloudflare's actual runtime)
 ### 8.2 Run
 
 ```bash
-python3 harness/test_proxy.py            # ~2s, 172 assertion rows
-python3 harness/mutation_check.py        # ~8s, 40 mutations, 6 in parallel
+python3 harness/test_proxy.py            # ~5s, 407 assertion rows, 32 controls
+python3 harness/mutation_check.py        # ~30s, 58 mutations, 6 in parallel
 python3 harness/probe_raw_socket.py      # ~0.3s, needs the sandbox CONNECT proxy
 ```
 
@@ -1023,6 +1030,34 @@ been**, or **survived that should not have**. There are no decorative entries.
 A surviving mutation is not a nuisance. It is the assertion reporting that it was not
 pinning what it claimed.
 
+### 8.5a What the timeout does and does not bound
+
+The timer is cleared once the response headers resolve, so `X-Proxy-Timeout-Ms`
+bounds **time to headers** and nothing else. `/__config` reports that as
+`timeout_scope`, README says it, and the code comment says it, and until this
+section nothing measured it: every timeout test used an origin that slept before
+sending headers, which is the case the deadline does bound.
+
+Two fixtures make the claim falsifiable in both directions. A peer that takes 34 s
+to send headers is refused at 30 s. A peer that sends headers at once and finishes
+its body 2 s later completes under a **250 ms** budget, because the timer is
+already gone.
+
+That second row is the one worth having. If a future edit moves `clearTimeout`
+inside the body read, the row fails, and the failure is the loss of a documented
+limit rather than a change in behaviour nobody agreed to.
+
+The 34 s figure is also the clearest v1 regression in the upgrade. Measured
+against one identical peer:
+
+```
+v1 -> status=200 after 34.0s  'late-headers'
+v2 -> status=502 after 30.0s  '{"error":"Upstream request timed out",...}'
+```
+
+v1 set no deadline at all. An origin that takes 34 s to send headers was served by
+v1 and is refused by v2, and section 6.2 says so.
+
 ### 8.6 Two clocks, and the second one was misreported for a while
 
 **Two corrections, both in this section, and the first one is bigger than it looks.**
@@ -1114,7 +1149,7 @@ wrote patched workers to one shared temp path.
 
 ### 8.8 What a passing mutation check still does not tell you
 
-The 40 mutations are all *behavioural* line edits. They cannot catch:
+The 58 mutations are all *behavioural* line edits. They cannot catch:
 
 - A wrong claim in this document. Nothing here checks prose.
 - A defect that only manifests on the real edge (section 9).
