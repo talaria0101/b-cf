@@ -414,8 +414,10 @@ const EDGE_IDENTITY = new Set([
 //
 // `authorization` and `proxy-authorization` are here for a specific reason: the
 // proxy's OWN credential is the caller's Authorization header, and forwarding it
-// would hand AUTH_TOKEN to every third-party origin. That is the same
-// credential-disclosure class v1 had with cookies.
+// would hand AUTH_TOKEN to every third-party origin. That is NOT the same as the
+// cookie case below: forwarding a caller's cookies to the target is intended
+// behaviour and stays available behind an opt-in, but this proxy's own token has
+// no reason to travel anywhere the caller did not name.
 const OWNED_HEADERS = new Set(["user-agent", "authorization", "proxy-authorization"]);
 
 // Values that give away a command-line or scripted client.

@@ -117,19 +117,47 @@ Cloudflare-owned. No header value can change what the origin sees here.
 
 ### 2.3 Other measured defects
 
-| Defect | Evidence |
+| **Defect** | Evidence |
 |---|---|
 | Query string silently dropped | `.../https://httpbin.org/anything?a=1&b=2` -> origin saw `https://httpbin.org/anything`. `pathname` is used and `search` is never re-appended. |
 | No CORS at all | Live response to `Origin: https://app.example` contains **0** `access-control-*` headers. Every browser caller is blocked by Same-Origin Policy. |
-| Client cookies leaked to third parties | `Cookie: session=secret123` reached the origin verbatim. |
-| Caller's `Referer` leaked verbatim | `Referer: https://secret-app.example/dashboard` reached the origin, naming an unrelated private app. |
 | One hardcoded UA, never varying | Every request returns the identical Safari 18.5 string. Byte-identical across repeated runs. |
 | No client hints | A rewritten Safari UA is sent with no `sec-ch-ua` at all, which is itself inconsistent. |
 
-The cookie and Referer findings are the ones I would flag hardest. v1 is an open,
-unauthenticated proxy that forwards a caller's session cookies and private
-`Referer` to **any destination on the internet**. That is a credential-disclosure
-primitive, and it is a finding independent of everything else in this document.
+### 2.4 Cookie and `Referer` forwarding: intended, with a consequence
+
+Two measured behaviours that are **not** defects, because they are what the proxy
+is for:
+
+```
+$ curl -s -H 'Cookie: session=secret123' \
+    'https://api.rv.pkgforge.dev/https://httpbin.org/anything'
+  -> Cookie: session=secret123        arrived verbatim
+
+$ curl -s -H 'Referer: https://secret-app.example/dashboard' \
+    'https://api.rv.pkgforge.dev/https://httpbin.org/anything'
+  -> Referer: https://secret-app.example/dashboard   arrived verbatim
+```
+
+PkgForge confirms this is intended behaviour, and on an open proxy it is
+load-bearing: a caller authenticating to an API through the proxy cannot do it
+any other way, because the browser attaches the session cookie to the proxy's
+request and the proxy is what relays it. Dropping it would break the service's
+main use.
+
+The consequence is real and is not a reason to change the behaviour, but it is the
+thing a caller has to know:
+
+> **This proxy will hand a cookie to any host you name.** If you call it with a
+> `Cookie` header set for a private application, the destination receives that
+> cookie. Only send cookies to destinations you already trust with them.
+
+v2 keeps the capability and changes the default: cookies are **not** forwarded
+unless the caller opts in per request with `X-Proxy-Forward-Cookies: 1`, and
+`Referer` is rewritten to the target's own origin rather than dropped or
+forwarded. Every v1 use case still works, because the opt-in is one header, and
+the default stops being the dangerous one. That is a breaking change and it is in
+[6.2](#62-behaviour-changes-that-will-break-an-existing-v1-caller).
 
 ---
 
@@ -531,8 +559,8 @@ Every row is an assertion in `harness/test_proxy.py`, run under real `workerd`.
 | Control headers never forwarded | `x-proxy-engine`, `x-proxy-persona` |
 | Caller hints dropped | a supplied `sec-ch-ua-model` cannot contradict the rewritten UA |
 | Genuine browser UA untouched | verbatim, **no** hints added |
-| Cookies not leaked by default | opt-in via `X-Proxy-Forward-Cookies: 1` |
-| `Referer` rewritten to target origin | no longer names the caller's private app |
+| Cookies **not** forwarded by default | intended capability, safer default. Opt back in per request with `X-Proxy-Forward-Cookies: 1`. |
+| `Referer` rewritten to target origin | no longer names the caller's private app. Also intended in v1, and also an opt-in-shaped decision rather than a removal. |
 | CORS complete | reflects `Origin`; preflight carries **ACAO**; appends to upstream `Vary`; no `allow-credentials` |
 | Response framing preserved | `content-encoding` kept; repeated `Set-Cookie` not comma-joined |
 | Redirects followed manually | headers rebuilt per hop; 303 downgrades to GET; **307/308 replay method and body** |
