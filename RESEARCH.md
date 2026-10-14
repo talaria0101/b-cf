@@ -594,6 +594,12 @@ than one that fails loudly.
 | `Accept` always sent | v1 sent none when the caller sent none, so a raw API client now receives the browser default unless it sets `Accept` explicitly. |
 | Timeout is per hop | Worst case `(MAX_REDIRECTS+1) x MAX_TIMEOUT_MS`. |
 | `cf-*` response headers dropped | v1 passed them through. Harmless; they are edge artefacts. |
+| Cookie consent is scoped to one host | `X-Proxy-Forward-Cookies: 1` forwards the cookie to the host the request names. A redirect to a different host does not inherit the consent. A v1 caller that relied on cookies surviving a cross-host redirect sees the target without them. |
+| `engine=tls` refuses a bodied request without `supportsBody` | A `POST` with `X-Proxy-Engine: tls` and a transport that has not declared `supportsBody = true` gets a **501**, not a bodiless request. Before the transport contract was tightened, an earlier build passed no method or body at all, so the destination received an empty `POST` and answered 200. |
+| The timeout bounds headers, not the body | `X-Proxy-Timeout-Ms` is cleared once response headers arrive. A destination that sends headers at once and stalls afterwards still completes. Aborting mid-stream would truncate a response already in progress, and there is no way to signal truncation through a streaming body. |
+| An `ALLOWED_HOSTS` entry may carry a port | The port is ignored. Earlier, an entry written as `origin.test:8443` matched nothing at all and refused every request, including the one it named. |
+| A `304` is returned, not followed | Earlier, any `3xx` carrying a `Location` was consumed as a redirect hop. `304` is not a redirect (RFC 9110 s15.4.5): it has no body, and its `Location` names the selected representation for a conditional request. Such a response is now passed through. |
+| `Location` is resolved against the hop it came from | A relative or protocol-relative `Location` is made absolute and rewritten into proxy space. Earlier, a relative `Location` was passed to the client unchanged, and a protocol-relative one named the host directly, in both cases sending the client off the proxy. |
 
 ### 6.3 What it deliberately does not do
 
@@ -819,10 +825,12 @@ rig/v1-baseline.js    v1, reformatted, with a 3-line provenance header (see 1)
 wrangler.toml         deploy config
 LICENSE               0BSD
 harness/rig.py        runs a worker under real workerd, with an in-process TAP origin
-harness/test_proxy.py  172 assertion rows in 6 sections, of which 5 are controls:
-                      120 v2, 10 auth, 7 allowlist, 16 engine/persona, 8 hostlist,
-                      6 v1 observation, 3 NEG-CONTROL, 2 CONTROL
-harness/mutation_check.py  40 mutations, each required to be caught
+harness/test_proxy.py  313 assertion rows in 11 sections, of which 14 are controls:
+                      152 v2 (C), 17 auth+allowlist (D), 21 engine/persona (E),
+                      8 engine/body (F), 12 hostlist (G), 11 redirect scoping (H),
+                      4 response edges (J), 65 header coverage (K), 23 CORS (L),
+                      6 v1 observation (A/B), of which 3 NEG-CONTROL and 11 CONTROL
+harness/mutation_check.py  51 mutations, each required to be caught
 harness/probe_raw_socket.py  the Layer 1 measurement: is connect() a raw stream?
 harness/probe_*.py    the five probes: four behind the timeout findings, plus
                       probe_raw_socket.py behind section 3.3
@@ -888,14 +896,27 @@ NEG-CONTROL v1: emits no CORS headers
 If those do not fire, the run reports **INVALID** and the v2 results are
 discarded. A suite that cannot fail proves nothing.
 
+`CONTROL:` rows sit inside the v2 sections. Each one is the negative half of a
+pair: it asserts that a defect or a branch selector **is** present, so it is valid
+when it passes. Scoping the control count to one section (as an earlier revision
+did) let a failing control elsewhere print VALID, so the tally now spans every
+section. 14 controls, all firing.
+
+A guard that has only been seen to refuse is indistinguishable from one that
+refuses everything, so each refusal has an acceptance row beside it. The clearest
+case is the `engine=tls` body contract: `supportsBody` absent refuses a `POST`,
+`supportsBody = false` refuses the same `POST` on a second worker, and
+`supportsBody = true` delivers it. Only the first two of those three prove the
+flag is read.
+
 ### 8.5 Mutation check
 
 A negative control proves the harness catches defects that already exist. It does
-**not** prove it would catch a regression introduced into v2. So 40 single-line
+**not** prove it would catch a regression introduced into v2. So 51 single-line
 mutations are applied to a copy of v2, and the suite must fail for each:
 
 ```
-40/40 mutations caught
+51/51 mutations caught
 OK: every mutation was detected, so the v2 assertions have teeth.
 ```
 

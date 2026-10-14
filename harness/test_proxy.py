@@ -1037,7 +1037,7 @@ def probe_tls_body():
     that has only been seen to refuse is indistinguishable from one that refuses
     everything: the two cases together are what make supportsBody mean something.
     """
-    print("\n=== E2. engine=tls with a body-capable transport ===")
+    print("\n=== F. engine=tls with a body-capable transport ===")
     r = Results()
     with open(V2) as fh:
         text = fh.read()
@@ -1163,7 +1163,7 @@ def probe_header_coverage():
     one has a CONTROL proving the header reached the proxy at all, because a
     header the client failed to send would make its own absence meaningless.
     """
-    print("\n=== J. header policy coverage: every entry pinned ===")
+    print("\n=== K. header policy coverage: every entry pinned ===")
     r = Results()
     with Rig(V2, "cover") as rig:
         # RFC 9110 s7.6.1 connection-specific headers, plus host and
@@ -1361,7 +1361,7 @@ def probe_cors_static():
     gracefully: it makes the feature unreachable from a browser caller, which is
     the entire reason a CORS proxy exists.
     """
-    print("\n=== K. CORS preflight contract ===")
+    print("\n=== L. CORS preflight contract ===")
     r = Results()
     with Rig(V2, "cors") as rig:
         st, hd, _ = rig.get("/", method="OPTIONS",
@@ -1417,7 +1417,7 @@ def probe_hostlist():
     the literal string "example.com,githubusercontent.com", which matches nothing
     and 403s everything.
     """
-    print("\n=== F. ALLOWED_HOSTS parsing (comma-separated, as documented) ===")
+    print("\n=== G. ALLOWED_HOSTS parsing (comma-separated, as documented) ===")
     r = Results()
     with open(V2) as fh:
         text = fh.read()
@@ -1521,7 +1521,7 @@ def probe_redirect_scope():
     could not be resolved, so it was returned verbatim and the client left the
     proxy. A 201 carrying a relative Location is ordinary REST behaviour.
     """
-    print("\n=== G. redirect scoping: cookies and Location ===")
+    print("\n=== H. redirect scoping: cookies and Location ===")
     r = Results()
     with Rig(V2, "redir") as rig:
         COOK = {"X-Proxy-Forward-Cookies": "1", "Cookie": "session=SUPERSECRET"}
@@ -1618,7 +1618,7 @@ def probe_response_edges():
 
     Two smaller gaps, both found by reading rather than by a failing test.
     """
-    print("\n=== I. response header edges ===")
+    print("\n=== J. response header edges ===")
     r = Results()
     with Rig(V2, "edges") as rig:
         # Vary: * is not a list. Appending produces "*, Origin", which

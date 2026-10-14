@@ -25,7 +25,7 @@ ALLOWED_HOSTS = "example.com,githubusercontent.com"
 ```
 
 Comma-separated, whitespace tolerated. The parsed list is reported at
-`GET /__config`.
+`GET /__config`. Entries match on hostname, so a port in an entry is ignored.
 
 Three request forms, all supported:
 
@@ -35,8 +35,9 @@ Three request forms, all supported:
 /?url=https%3A%2F%2Fexample.com%2Fpath
 ```
 
-`GET /__config` reports the resolved timeout, the effective allowlist, whether
-auth is required, and whether a `TLS_TRANSPORT` binding is present.
+`GET /__config` reports the resolved timeout and its scope, the effective
+allowlist and how it matches, whether auth is required, and whether a
+`TLS_TRANSPORT` binding is present and whether it can send a body.
 
 ## Request identity
 
@@ -62,18 +63,39 @@ since a caller's `sec-ch-ua-platform` beside this proxy's UA is the same kind of
 mismatch. A caller whose own UA is forwarded untouched keeps its hints.
 
 `X-Proxy-Engine: tls` selects a userland TLS transport bound as `TLS_TRANSPORT`,
-which must expose `fetch(url, { headers, signal }) -> Response`. Without that
-binding the request gets a **501** naming the missing binding, rather than
-quietly using the `fetch()` path the caller was avoiding. `TLS_TRANSPORT` is not
-implemented here; see `RESEARCH.md` section 3.3 and Limits item 4.
+which must expose `fetch(url, { method, headers, body, signal }) -> Response`.
+Without that binding the request gets a **501** naming the missing binding, rather
+than quietly using the `fetch()` path the caller was avoiding. `TLS_TRANSPORT` is
+not implemented here; see `RESEARCH.md` section 3.3 and Limits item 4.
+
+A transport that cannot send a request body must say so. If the request has a
+body and the transport does not declare `supportsBody = true`, the request is
+refused with a **501** rather than sent without its payload. `GET /__config`
+reports `tls_transport_supports_body` so a deployment can tell the two apart.
 
 Both headers are stripped before the request reaches the destination.
+
+## What is forwarded, and where
+
+Cookie forwarding is opt-in per request (`X-Proxy-Forward-Cookies: 1`) and is
+scoped to the host the caller named. A redirect to a different host does not
+carry the consent: the caller consented to the origin they asked for, not to
+wherever that origin points.
+
+`X-Proxy-Timeout-Ms` bounds time to response **headers**. It does not bound the
+body. The timer is cleared once the headers arrive, so an origin that sends
+headers at once and then stalls still completes. `GET /__config` reports this as
+`timeout_scope`.
+
+`ALLOWED_HOSTS` matches on hostnames. A port in an entry is ignored rather than
+making the entry match nothing, and port-based restriction is not available on
+this path. `GET /__config` reports this as `allowed_hosts_match`.
 
 ## Run the proofs
 
 ```bash
-python3 harness/test_proxy.py            # 172 assertion rows (5 controls), ~2s
-python3 harness/mutation_check.py        # 40 mutations, all must be caught, ~8s
+python3 harness/test_proxy.py            # 313 assertion rows (14 controls), ~3s
+python3 harness/mutation_check.py        # 51 mutations, all must be caught, ~8s
 python3 harness/probe_raw_socket.py      # the TLS-raw-stream measurement, ~0.3s
 ```
 
